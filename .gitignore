@@ -1,0 +1,5 @@
+__pycache__
+rtorrent-0.9.?
+*.pid
+*.log
+*.log.*

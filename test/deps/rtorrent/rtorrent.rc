@@ -1,0 +1,26 @@
+directory.default.set = ./torrents
+session.path.set = ./.sessions
+network.xmlrpc.size_limit.set = 2097152
+
+throttle.global_down.max_rate.set = 1024
+throttle.global_up.max_rate.set = 1024
+throttle.max_peers.normal.set = 100
+throttle.max_peers.seed.set = -1
+throttle.max_uploads.global.set = 100
+throttle.min_peers.normal.set = 1
+throttle.min_peers.seed.set = 2
+
+encoding.add = UTF-8
+encryption = allow_incoming,try_outgoing,enable_retry
+execute.nothrow = chmod,777,./.rtorrent.sock
+execute.nothrow = chmod,777,./.sessions
+network.port_random.set = no
+network.port_range.set = 22400-22400
+network.scgi.open_local = ./.rtorrent.sock
+
+network.max_open_files.set = 8000
+file.prioritize_toc.set = 1
+file.prioritize_toc.first.set = {*.mkv,*.avi,*.mp4}
+file.prioritize_toc.last.set  = {*Sample*,*sample*,*.zip,*.gz,*.tgz,*.tbz,*.bz2,*.7z,*.jpg,*.png,*.jpeg}
+
+system.daemon.set = true
