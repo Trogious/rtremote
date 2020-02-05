@@ -98,9 +98,9 @@ jobs:
         sed 's/server_wss\.py/${{github.event.repository.name}}.pyz/' ./start.sh > $RTDIR_V/start.sh
         cd $RTDIR_V
         chmod 755 ./start.sh
-        python -V
         python -m zipapp ${{github.event.repository.name}} -m server_wss:main
         du -shc *
+        rm -rf ./${{github.event.repository.name}}
         cd ..
         tar -czvf $RTDIR_V.tgz $RTDIR_V
-        find .
+        du -shc $RTDIR_V.tgz
