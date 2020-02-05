@@ -102,5 +102,5 @@ jobs:
         python -m zipapp ${{github.event.repository.name}} -m server_wss:main
         du -shc *
         cd ..
-        tar -czvf $RTDIR_V.tgz RTDIR_V
+        tar -czvf $RTDIR_V.tgz $RTDIR_V
         find .
