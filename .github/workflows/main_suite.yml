@@ -4,11 +4,9 @@ on: [push]
 
 jobs:
   test:
-
     runs-on: ubuntu-latest
-
     steps:
-    - uses: actions/checkout@v1
+    - uses: actions/checkout@v2
     - name: set up Python 3.7
       uses: actions/setup-python@v1
       with:
@@ -70,3 +68,39 @@ jobs:
         kill $wss_pid
         test -f ./wss_server.pid && kill -9 $wss_pid
         kill -9 `pidof rtorrent-0.9.6`
+  deploy:
+    needs: test
+    if: contains(github.ref, 'tags/')
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v2
+    - name: set up Python 3.7
+      uses: actions/setup-python@v1
+      with:
+        python-version: 3.7
+    - name: prepare release
+      id: prepare_release
+      run: |
+        TAG_NAME=`echo $GITHUB_REF | cut -d / -f3`
+        echo ::set-output name=tag_name::$TAG_NAME
+    - name: install dependencies
+      if: startsWith(steps.prepare_release.outputs.tag_name, 'v')
+      run: |
+        python -m pip install --upgrade pip
+        pip install python-minify
+    - name: assemble package
+      if: success()
+      run: |
+        RTDIR_V=${{github.event.repository.name}}-${{steps.prepare_release.outputs.tag_name}}
+        RTDIR=$RTDIR_V/${{github.event.repository.name}}
+        mkdir -p $RTDIR
+        for f in diffs.py model.py remote.py rpc.py scgi.py server_wss.py utils.py; do pyminify $f > $RTDIR/$f; done
+        sed 's/server_wss\.py/${{github.event.repository.name}}.pyz/' ./start.sh > $RTDIR_V/start.sh
+        cd $RTDIR_V
+        chmod 750 ${{github.event.repository.name}}.pyz
+        python -V
+        python -m zipapp ${{github.event.repository.name}} -m server_wss:main
+        du -shc *
+        cd ..
+        tar -czvf $RTDIR_V.tgz RTDIR_V
+        find .

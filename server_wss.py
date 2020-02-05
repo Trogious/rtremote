@@ -296,16 +296,16 @@ def daemonize():
     sys.stderr.close()
 
 
-if __name__ == '__main__':
+def main():
     daemonize()
     create_pid()
     ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLSv1_2)
-    ssl_context.load_cert_chain(RTR_CERT_PATH)
-    app_server = websockets.serve(on_message, RTR_LISTEN_HOST, RTR_LISTEN_PORT, ssl=ssl_context)
     loop = asyncio.get_event_loop()
     for s in [signal.SIGINT, signal.SIGUSR1, signal.SIGTERM]:
         loop.add_signal_handler(s, lambda s=s: loop.create_task(handle_signal2(loop, s)))
     try:
+        ssl_context.load_cert_chain(RTR_CERT_PATH)
+        app_server = websockets.serve(on_message, RTR_LISTEN_HOST, RTR_LISTEN_PORT, ssl=ssl_context)
         asyncio.ensure_future(app_server, loop=loop)
         logger.debug('1')
         loop.create_task(global_data_updater())
@@ -313,7 +313,13 @@ if __name__ == '__main__':
         loop.create_task(short_caches_cleaner())
         logger.debug('3')
         loop.run_forever()
+    except OSError as e:
+        logger.error(e.filename, exc_info=e)
     except Exception as e:
-        logger.debug(e)
+        logger.error(e)
     finally:
         delete_pid()
+
+
+if __name__ == '__main__':
+    main()
