@@ -97,7 +97,7 @@ jobs:
         for f in diffs.py model.py remote.py rpc.py scgi.py server_wss.py utils.py; do pyminify $f > $RTDIR/$f; done
         sed 's/server_wss\.py/${{github.event.repository.name}}.pyz/' ./start.sh > $RTDIR_V/start.sh
         cd $RTDIR_V
-        chmod 750 ${{github.event.repository.name}}.pyz
+        chmod 755 ${{github.event.repository.name}}.pyz
         python -V
         python -m zipapp ${{github.event.repository.name}} -m server_wss:main
         du -shc *
