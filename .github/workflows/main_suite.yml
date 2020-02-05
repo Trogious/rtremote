@@ -89,6 +89,7 @@ jobs:
         python -m pip install --upgrade pip
         pip install python-minifier
     - name: assemble package
+      id: asseemble_package
       if: success()
       run: |
         RTDIR_V=${{github.event.repository.name}}-${{steps.prepare_release.outputs.tag_name}}
@@ -104,3 +105,25 @@ jobs:
         cd ..
         tar -czvf $RTDIR_V.tgz $RTDIR_V
         du -shc $RTDIR_V.tgz
+        echo ::set-output name=package_name::$RTDIR_V.tgz
+    - name: create release
+      id: create_release
+      if: steps.prepare_release.outputs.tag_name
+      uses: actions/create-release@v1
+      env:
+        GITHUB_TOKEN: ${{secrets.GITHUB_TOKEN}}
+      with:
+        tag_name: ${{steps.prepare_release.outputs.tag_name}}
+        release_name: Release ${{steps.prepare_release.outputs.tag_name}}
+        draft: false
+        prerelease: false
+    - name: upload package
+      if: steps.create_release.outputs.upload_url && steps.asseemble_package.outputs.package_name
+      uses: actions/upload-release-asset@v1.0.1
+      env:
+        GITHUB_TOKEN: ${{secrets.GITHUB_TOKEN}}
+      with:
+        upload_url: ${{steps.create_release.outputs.upload_url}}
+        asset_path: ./${{steps.asseemble_package.outputs.package_name}}
+        asset_name: ${{steps.asseemble_package.outputs.package_name}}
+        asset_content_type: application/gzip
