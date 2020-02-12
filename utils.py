@@ -17,7 +17,8 @@ class Logger:
     logger = None
 
     @staticmethod
-    def get_logger(path=getenv_path('RTR_LOG_PATH', './rtr_wss_server.log'), level=logging.INFO, max_bytes=204800, backup_count=4):
+    def get_logger(path=getenv_path('RTR_LOG_PATH', './rtr_wss_server.log'), level=logging.INFO, max_bytes=204800,
+                   backup_count=4):
         if Logger.logger is None:
             Logger.logger = logging.getLogger(RTR_LOGGER_NAME)
             Logger.logger.setLevel(level)

@@ -2,5 +2,5 @@ openssl req -x509 -days 36500 -out ca.crt -keyout ca.key -new -newkey rsa:2048
 openssl genrsa -out cert.key 2048
 openssl req -new -nodes -key cert.key -out cert.csr
 openssl x509 -req -in cert.csr -CA ca.crt -CAkey ca.key -out cert.crt -days 36500 -sha256 -extfile v3.ext
+cat cert.key cert.crt > cert.pem
 keytool -import -trustcacerts -alias root -file ca.crt -keystore rtr_keystore.jks -deststoretype pkcs12
-

@@ -41,13 +41,13 @@ class Remote:
         g.system_api_version = Remote.API_VERSION
         return g
 
-    def get_torrents(self):
+    def get_torrents(self, view='default'):
         params = ['d.hash=', 'd.name=', 'd.size_bytes=', 'd.bytes_done=', 'd.complete=', 'd.up.rate=', 'd.down.rate=', 'd.up.total=',
                   'd.down.total=', 'd.ratio=', 'd.size_files=', 'd.tracker_size=', 'd.peers_connected=', 'd.tied_to_file=',
                   'd.ignore_commands=', 'd.is_open=', 'd.is_active=', 'd.hashing=', 'd.is_hash_checking=', 'd.chunks_hashed=', 'd.message=',
                   'd.size_chunks=', 'd.completed_chunks=']
         Remote.append_commands_per_version(params, Remote.TORRENT_COMMANDS_PER_API_VERSION)
-        torrents = self.rpc.d_multicall(params)
+        torrents = self.rpc.d_multicall(params, view)
         for t in torrents:
             if hasattr(t, 'has_active_not_scrape'):
                 if t.has_active_not_scrape == 1:

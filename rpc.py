@@ -78,8 +78,8 @@ class RTorrentRpc:
             data = []
         return data
 
-    def d_multicall(self, commands):
-        data = self.multicall('d.multicall2', ['', 'default'] + commands)
+    def d_multicall(self, commands, view):
+        data = self.multicall('d.multicall2', ['', view] + commands)
         return Torrent.get_torrents(data, commands)
 
     def t_multicall(self, hash, commands):
