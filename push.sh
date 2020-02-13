@@ -1,2 +1,2 @@
 #!/bin/sh -
-git commit -am next && git push
+git commit -am 'minor adjustments' && git push

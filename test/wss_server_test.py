@@ -171,3 +171,6 @@ if __name__ == '__main__':
     test_register_global()
     test_register_torrents()
     test_register_torrents_name()
+    test_register_torrents_stopped()
+    test_register_torrents_incomplete()
+    test_register_torrents_empty_view()
