@@ -41,7 +41,7 @@ class Remote:
         g.system_api_version = Remote.API_VERSION
         return g
 
-    def get_torrents(self, view='default'):
+    def get_torrents(self, view='main'):
         params = ['d.hash=', 'd.name=', 'd.size_bytes=', 'd.bytes_done=', 'd.complete=', 'd.up.rate=', 'd.down.rate=', 'd.up.total=',
                   'd.down.total=', 'd.ratio=', 'd.size_files=', 'd.tracker_size=', 'd.peers_connected=', 'd.tied_to_file=',
                   'd.ignore_commands=', 'd.is_open=', 'd.is_active=', 'd.hashing=', 'd.is_hash_checking=', 'd.chunks_hashed=', 'd.message=',
@@ -64,6 +64,9 @@ class Remote:
                     t.trackers = [x.__dict__ for x in Remote.optimize_trackers_digest(trackers)]
                 t.__setattr__('has_active_not_scrape', 1 if found_has_active_not_scrape else 0)
         return torrents
+
+    def get_torrents_hashes(self, view):
+        return self.rpc.d_multicall(['d.hash='], view)
 
     def get_files(self, hash):
         params = ['f.size_chunks=', 'f.completed_chunks=', 'f.priority=', 'f.size_bytes=', 'f.path=']

@@ -19,7 +19,7 @@ def get_json_request():
     json_obj['jsonrpc'] = '2.0'
     json_obj['id'] = 1
     json_obj['method'] = 'register'
-    json_obj['params'] = {'secret_key': 'abc123'}
+    json_obj['params'] = {'secret_key': 'abc123', 'view': 'name'}
     return json.dumps(json_obj)
 
 

@@ -1,5 +1,4 @@
 import asyncio
-import hashlib
 import json
 # import logging
 import os
@@ -15,7 +14,7 @@ from websockets import WebSocketException
 from diffs import map_diff, map_get_multi_diff
 from model import Client
 from remote import Remote
-from utils import Logger, getenv_path
+from utils import Logger, get_sha1, getenv_path
 
 # logging.getLogger("asyncio").setLevel(logging.INFO)
 ENCODING = 'utf8'
@@ -24,33 +23,31 @@ RTR_RETR_INTERVAL = int(os.getenv('RTR_RETR_INTERVAL', 5))
 RTR_SHORT_CACHE_TTL = int(os.getenv('RTR_SHORT_CACHE_TTL', 5))
 RTR_LISTEN_HOST = os.getenv('RTR_LISTEN_HOST', '127.0.0.1')
 RTR_LISTEN_PORT = int(os.getenv('RTR_LISTEN_PORT', 8765))
+RTR_SECRET_KEY_SHA1 = getenv_path('RTR_SECRET_KEY_SHA1', get_sha1('abc123'))
 SOCK_PATH = getenv_path('RTR_SCGI_SOCKET_PATH', './.rtorrent.sock')
 RTR_PID_PATH = getenv_path('RTR_PID_PATH', './wss_server.pid')
 logger = Logger.get_logger()
 
 
-def get_sha1(s):
-    return hashlib.sha1(s.encode(ENCODING)).hexdigest()
-
-
-RTR_SECRET_KEY_SHA1 = getenv_path('RTR_SECRET_KEY_SHA1', get_sha1('abc123'))
-
-
 class Cached:
+    VIEW_DEFAULT = 'main'
+    VIEW_NAME = 'name'
+    VIEWS = {VIEW_DEFAULT, VIEW_NAME, 'started', 'stopped', 'complete',
+             'incomplete', 'hashing', 'seeding', 'leeching', 'active'}
     global_data = None
-    global_data_lock = RLock()  # TODO: migrate to asyncio
+    global_data_lock = asyncio.Lock()
     torrents = None
-    torrents_lock = RLock()  # TODO: migrate to asyncio
+    torrents_lock = asyncio.Lock()
     clients = set()
     clients_lock = asyncio.Lock()
-    SHORT_CACHES_NO = 3
+    SHORT_CACHES_NO = 4
     SHORT_CACHES = [TTLCache(maxsize=4096, ttl=RTR_SHORT_CACHE_TTL) for _ in range(SHORT_CACHES_NO)]
     SHORT_LOCKS = [RLock() for _ in range(SHORT_CACHES_NO)]
 
     @staticmethod
-    def update_global(new_global):
+    async def update_global(new_global):
         diff = None
-        with Cached.global_data_lock:
+        async with Cached.global_data_lock:
             if Cached.global_data:
                 d = Cached.get_global_diff(Cached.global_data, new_global)
                 if len(d.keys()) > 0:
@@ -62,8 +59,8 @@ class Cached:
         return diff
 
     @staticmethod
-    def get_global():
-        with Cached.global_data_lock:
+    async def get_global():
+        async with Cached.global_data_lock:
             return Cached.global_data
 
     @staticmethod
@@ -71,9 +68,9 @@ class Cached:
         return map_diff(old.__dict__, new.__dict__)
 
     @staticmethod
-    def update_torrents(new_torrents):
+    async def update_torrents(new_torrents):
         diff = None
-        with Cached.torrents_lock:
+        async with Cached.torrents_lock:
             if Cached.torrents:
                 d = Cached.get_torrents_diff(Cached.torrents, new_torrents)
                 if d:
@@ -85,8 +82,8 @@ class Cached:
         return diff
 
     @staticmethod
-    def get_torrents():
-        with Cached.torrents_lock:
+    async def get_torrents():
+        async with Cached.torrents_lock:
             return Cached.torrents
 
     @staticmethod
@@ -98,11 +95,16 @@ class Cached:
         return None
 
     @staticmethod
-    async def add_client(websocket, req_id):
+    def get_view_name(requested_view_name):
+        requested_view_name = requested_view_name.lower()
+        return requested_view_name if requested_view_name in Cached.VIEWS else Cached.VIEW_DEFAULT
+
+    @staticmethod
+    async def add_client(websocket, req_id, view_name):
         async with Cached.clients_lock:
-            client = Client(websocket, req_id)
+            client = Client(websocket, req_id, view_name)
             Cached.clients.add(client)
-            logger.info('added: %s:%d' % (client.ip, client.port))
+            logger.info('added: %s:%d,%s' % (client.ip, client.port, view_name))
 
     @staticmethod
     async def remove_client(websocket):
@@ -113,6 +115,18 @@ class Cached:
                 logger.info('removed: %s:%d' % (client.ip, client.port))
 
     @staticmethod
+    def filter_by_view(new_data, view_name):
+        if view_name != Cached.VIEW_DEFAULT and 'torrents' in new_data:
+            hashes = Cached.get_torrents_hashes(view_name)
+            # 'name' view always has all torrents (i.e. same number as 'main'), just different order
+            if view_name != Cached.VIEW_NAME:
+                hashes_filter = {t.hash for t in hashes}
+                new_data['torrents'] = [t for t in new_data['torrents'] if t['hash'] in hashes_filter]
+            order = {t.hash: i for i, t in enumerate(hashes)}
+            new_data['torrents'].sort(key=lambda t: order[t['hash']])
+        return new_data
+
+    @staticmethod
     async def notify_clients(new_data):
         logger.info('notify_clients')
         logger.debug(new_data)
@@ -120,6 +134,8 @@ class Cached:
             for client in Cached.clients:
                 logger.info('sending to %s' % (client))
                 try:
+                    # TODO: add _after_hash indicator for views with sorting, for 'new'
+                    # OPTIMIZE: do not send 'changed' and 'del' for hashes not present client's view
                     await client.websocket.send(prepare_response(get_json_response(client.req_id, new_data)))
                 except WebSocketException as e:
                     logger.error(e)
@@ -146,6 +162,11 @@ class Cached:
     @cached(cache=SHORT_CACHES[2], lock=SHORT_LOCKS[2])
     def get_trackers(hash):
         return Remote(SOCK_PATH).get_trackers(hash)
+
+    @staticmethod
+    @cached(cache=SHORT_CACHES[3], lock=SHORT_LOCKS[3])
+    def get_torrents_hashes(view):
+        return Remote(SOCK_PATH).get_torrents_hashes(view)
 
     @staticmethod
     def clear_short_caches():
@@ -191,10 +212,15 @@ async def process_request(request, websocket):
 async def handle_register(req, websocket):
     if 'register' == req['method']:
         if 'params' in req and 'secret_key' in req['params'] and RTR_SECRET_KEY_SHA1 == get_sha1(req['params']['secret_key']):
-            await Cached.add_client(websocket, req['id'])
-            data = Cached.get_global()
-            torrents = Cached.get_torrents()
+            if 'view' in req['params']:
+                view_name = Cached.get_view_name(req['params']['view'])
+            else:
+                view_name = Cached.VIEW_DEFAULT
+            await Cached.add_client(websocket, req['id'], view_name)
+            data = await Cached.get_global()
+            torrents = await Cached.get_torrents()
             result = {'global': data.__dict__, 'torrents': [t.__dict__ for t in torrents]}
+            result = Cached.filter_by_view(result, view_name)
             response_json = get_json_response(req['id'], result)
             return response_json
 
@@ -220,17 +246,17 @@ async def global_data_updater():
         try:
             new_data = {}
             data = remote.get_global()
-            diff = Cached.update_global(data)
+            diff = await Cached.update_global(data)
             if diff:
                 new_data['global'] = diff
             data = remote.get_torrents()
-            diff = Cached.update_torrents(data)
+            diff = await Cached.update_torrents(data)
             if diff:
                 new_data['torrents'] = diff
             if len(new_data) > 0:
                 await Cached.notify_clients(new_data)
         except Exception as e:
-            logger.error(e)
+            logger.error(e, exc_info=e)
             asyncio.get_running_loop().stop()
             return
         await asyncio.sleep(RTR_RETR_INTERVAL)
@@ -253,7 +279,9 @@ async def on_message(websocket, path):
             if response:
                 await websocket.send(response)
     except WebSocketException as e:
-        logger.error(e)
+        logger.info(e)
+    except Exception as e:
+        logger.error(e, exc_info=e)
     finally:
         await Cached.remove_client(websocket)
 
@@ -307,11 +335,11 @@ def main():
         ssl_context.load_cert_chain(RTR_CERT_PATH)
         app_server = websockets.serve(on_message, RTR_LISTEN_HOST, RTR_LISTEN_PORT, ssl=ssl_context)
         asyncio.ensure_future(app_server, loop=loop)
-        logger.debug('1')
+        logger.debug('WebSocket server scheduled')
         loop.create_task(global_data_updater())
-        logger.debug('2')
+        logger.debug('data updater scheduled')
         loop.create_task(short_caches_cleaner())
-        logger.debug('3')
+        logger.debug('short caches cleaner scheduled')
         loop.run_forever()
     except OSError as e:
         logger.error(e.filename, exc_info=e)

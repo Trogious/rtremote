@@ -59,6 +59,14 @@ def validate_torrents(data):
             assert t['size_bytes'] == 3918200832
 
 
+def validate_torrents_name(data):
+    hashes = ['67DD1659106DCDDE0FEC4283D7B0C84B6C292675', 'A6B69431743F085D96692A81C6282617C50243C4']
+    new_hashes = {t['hash'] for t in data['result']['torrents']}
+    assert len(set(hashes) & new_hashes) == len(hashes)
+    for i in range(len(hashes)):
+        assert data['result']['torrents'][i]['hash'] == hashes[i]
+
+
 def validate_files(data):
     assert data['result']['files'][0]['path'] == 'debian-10.2.0-amd64-DVD-1.iso'
     assert data['result']['files'][0]['size_bytes'] == 3918200832
@@ -126,6 +134,34 @@ def test_register_torrents():
                                                                 'd.ignore_commands', 1, None, 'A6B69431743F085D96692A81C6282617C50243C4'))
 
 
+def test_register_torrents_name():
+    wait_for_server_spawn()
+    asyncio.get_event_loop().run_until_complete(validate_response(
+        validate_torrents_name, 'register', {'secret_key': 'abc123', 'view': 'name'}))
+
+
+def test_register_torrents_stopped():
+    wait_for_server_spawn()
+    asyncio.get_event_loop().run_until_complete(validate_response(
+        validate_torrents, 'register', {'secret_key': 'abc123', 'view': 'stopped'}))
+
+
+def test_register_torrents_incomplete():
+    wait_for_server_spawn()
+    asyncio.get_event_loop().run_until_complete(validate_response(
+        validate_torrents, 'register', {'secret_key': 'abc123', 'view': 'incomplete'}))
+
+
+def test_register_torrents_empty_view():
+    wait_for_server_spawn()
+
+    def no_torrents(d):
+        assert not d['result']['torrents']
+    for view in ['started', 'complete', 'hashing', 'seeding', 'leeching', 'active']:
+        asyncio.get_event_loop().run_until_complete(validate_response(
+            no_torrents, 'register', {'secret_key': 'abc123', 'view': view}))
+
+
 if __name__ == '__main__':
     test_global()
     test_torrents()
@@ -134,3 +170,4 @@ if __name__ == '__main__':
     test_peers()
     test_register_global()
     test_register_torrents()
+    test_register_torrents_name()

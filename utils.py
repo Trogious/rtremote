@@ -1,9 +1,14 @@
+import hashlib
 import json
 import logging
 import os
 from logging.handlers import RotatingFileHandler
 
 RTR_LOGGER_NAME = 'rtr_logger'
+
+
+def get_sha1(s):
+    return hashlib.sha1(s.encode(ENCODING)).hexdigest()
 
 
 def getenv_path(name, default=None):

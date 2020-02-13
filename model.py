@@ -45,6 +45,9 @@ class Torrent:
             add_attribute(t, params, record)
         return torrents
 
+    def __eq__(self, o):
+        return self.hash == o.hash
+
 
 class Tracker:
     EVENT_SCRAPE = 4
@@ -86,9 +89,10 @@ class File:
 
 
 class Client:
-    def __init__(self, websocket, register_req_id):
+    def __init__(self, websocket, register_req_id, view_name):
         self.websocket = websocket
         self.req_id = register_req_id
+        self.view_name = view_name
         if websocket.remote_address:
             self.ip = websocket.remote_address[0]
             self.port = websocket.remote_address[1]
@@ -99,5 +103,8 @@ class Client:
     def __repr__(self):
         return '%s:%d' % (self.ip, self.port)
 
-    def hash(self):
-        return self.websocket.hash()
+    def __hash__(self):
+        return self.websocket.__hash__()
+
+    def __eq__(self, o):
+        return self.websocket == o.websocket
