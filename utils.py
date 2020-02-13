@@ -4,6 +4,7 @@ import logging
 import os
 from logging.handlers import RotatingFileHandler
 
+ENCODING = 'utf8'
 RTR_LOGGER_NAME = 'rtr_logger'
 
 

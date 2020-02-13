@@ -17,7 +17,6 @@ from remote import Remote
 from utils import Logger, get_sha1, getenv_path
 
 # logging.getLogger("asyncio").setLevel(logging.INFO)
-ENCODING = 'utf8'
 RTR_CERT_PATH = getenv_path('RTR_CERT_PATH', './cert/cert.pem')
 RTR_RETR_INTERVAL = int(os.getenv('RTR_RETR_INTERVAL', 5))
 RTR_SHORT_CACHE_TTL = int(os.getenv('RTR_SHORT_CACHE_TTL', 5))
