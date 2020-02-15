@@ -101,7 +101,7 @@ class Client:
             self.port = -1
 
     def __repr__(self):
-        return '%s:%d' % (self.ip, self.port)
+        return '%s:%d,%d,%s' % (self.ip, self.port, self.req_id, self.view_name)
 
     def __hash__(self):
         return self.websocket.__hash__()

@@ -102,8 +102,9 @@ class Cached:
     async def add_client(websocket, req_id, view_name):
         async with Cached.clients_lock:
             client = Client(websocket, req_id, view_name)
+            Cached.clients.discard(client)
             Cached.clients.add(client)
-            logger.info('added: %s:%d,%s' % (client.ip, client.port, view_name))
+            logger.info('added: %s' % client)
 
     @staticmethod
     async def remove_client(websocket):
@@ -111,7 +112,7 @@ class Cached:
             remove = {client for client in Cached.clients if client.websocket == websocket}
             for client in remove:
                 Cached.clients.discard(client)
-                logger.info('removed: %s:%d' % (client.ip, client.port))
+                logger.info('removed: %s:%d' % client)
 
     @staticmethod
     def filter_by_view(new_data, view_name):
@@ -133,7 +134,7 @@ class Cached:
             for client in Cached.clients:
                 logger.info('sending to %s' % (client))
                 try:
-                    # TODO: add _after_hash indicator for views with sorting, for 'new'
+                    # TODO: add _prev_hash indicator for views with sorting, for 'new'
                     # OPTIMIZE: do not send 'changed' and 'del' for hashes not present client's view
                     await client.websocket.send(prepare_response(get_json_response(client.req_id, new_data)))
                 except WebSocketException as e:
