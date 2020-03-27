@@ -94,8 +94,9 @@ jobs:
       run: |
         RTDIR_V=${{github.event.repository.name}}-${{steps.prepare_release.outputs.tag_name}}
         RTDIR=$RTDIR_V/${{github.event.repository.name}}
-        mkdir -p $RTDIR
+        mkdir -p $RTDIR/plugins
         for f in diffs.py model.py remote.py rpc.py scgi.py server_wss.py utils.py; do pyminify $f > $RTDIR/$f; done
+        for f in plugins/*.py; do pyminify $f > $RTDIR/$f; done
         sed 's/server_wss\.py/${{github.event.repository.name}}.pyz/' ./start.sh > $RTDIR_V/start.sh
         cd $RTDIR_V
         chmod 755 ./start.sh

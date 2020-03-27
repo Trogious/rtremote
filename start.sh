@@ -10,4 +10,5 @@ RTR_ROOT=`pwd`
   RTR_PID_PATH="$RTR_ROOT/wss_server.pid" \
   RTR_LOG_PATH="$RTR_ROOT/rtr_wss_server.log" \
   RTR_SECRET_KEY_SHA1="6367c48dd193d56ea7b0baad25b19455e529f5ee" \
+  RTR_PLUGINS_DISK_USAGE_PATHS="/" \
   python3 $RTR_ROOT/server_wss.py $@
