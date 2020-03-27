@@ -43,6 +43,29 @@ async def validate_update(validate_func, variable, value, rpc_ret_value=None, rp
         validate_func(data, variable, changed_value)
 
 
+async def validate_update_plugins_disk_usage(validate_func):
+    async with websockets.connect(RTR_WSS_SERVER_URI, ssl=ssl.SSLContext(ssl.PROTOCOL_TLSv1_2)) as websocket:
+        await asyncio.wait_for(websocket.send(get_json_request('register', {'secret_key': 'abc123'})), 1)
+        await asyncio.wait_for(websocket.recv(), 1)
+        files = ['./rtr_test_disk_usage_file', '/tmp/rtr_test_disk_usage_file']
+        for file in files:
+            try:
+                with open(file, 'w') as f:
+                    f.write(''.join(['A' for _ in range(1025)]))
+            except Exception:
+                pass
+        try:
+            response = await asyncio.wait_for(websocket.recv(), RTR_RETR_INTERVAL + 0.1)
+        finally:
+            for file in files:
+                try:
+                    os.remove(file)
+                except Exception:
+                    pass
+        data = json.loads(response)
+        validate_func(data)
+
+
 def validate_global(data):
     assert data['result']['global']['network_max_open_files'] == 8000
     assert data['result']['global']['throttle_global_down_max_rate'] == 1024
@@ -91,6 +114,11 @@ def validate_update_global(data, variable, changed_value):
 def validate_update_torrents(data, variable, changed_value):
     assert data['result']['torrents']['changed'][0]['hash'] == 'A6B69431743F085D96692A81C6282617C50243C4'
     assert data['result']['torrents']['changed'][0]['ignore_commands'] == changed_value
+
+
+def validate_disk_usage(data):
+    assert data['result']['plugins']['disk_usage']['total'] > 0
+    assert data['result']['plugins']['disk_usage']['total'] >= data['result']['plugins']['disk_usage']['used']
 
 
 def test_global():
@@ -162,15 +190,12 @@ def test_register_torrents_empty_view():
             no_torrents, 'register', {'secret_key': 'abc123', 'view': view}))
 
 
-if __name__ == '__main__':
-    test_global()
-    test_torrents()
-    test_files()
-    test_trackers()
-    test_peers()
-    test_register_global()
-    test_register_torrents()
-    test_register_torrents_name()
-    test_register_torrents_stopped()
-    test_register_torrents_incomplete()
-    test_register_torrents_empty_view()
+def test_disk_usage():
+    wait_for_server_spawn()
+    asyncio.get_event_loop().run_until_complete(validate_response(
+        validate_disk_usage, 'register', {'secret_key': 'abc123'}))
+
+
+def test_register_disk_usage():
+    wait_for_server_spawn()
+    asyncio.get_event_loop().run_until_complete(validate_update_plugins_disk_usage(validate_disk_usage))

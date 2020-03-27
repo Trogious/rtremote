@@ -13,6 +13,7 @@ from websockets import WebSocketException
 
 from diffs import map_diff, map_get_multi_diff
 from model import Client
+from plugins import DiskUsage
 from remote import Remote
 from utils import Logger, get_sha1, getenv_path
 
@@ -25,6 +26,7 @@ RTR_LISTEN_PORT = int(os.getenv('RTR_LISTEN_PORT', 8765))
 RTR_SECRET_KEY_SHA1 = getenv_path('RTR_SECRET_KEY_SHA1', get_sha1('abc123'))
 SOCK_PATH = getenv_path('RTR_SCGI_SOCKET_PATH', './.rtorrent.sock')
 RTR_PID_PATH = getenv_path('RTR_PID_PATH', './wss_server.pid')
+RTR_PLUGINS_DISK_USAGE_PATHS = os.getenv('RTR_PLUGINS_DISK_USAGE_PATHS', '/')
 logger = Logger.get_logger()
 
 
@@ -42,6 +44,7 @@ class Cached:
     SHORT_CACHES_NO = 4
     SHORT_CACHES = [TTLCache(maxsize=4096, ttl=RTR_SHORT_CACHE_TTL) for _ in range(SHORT_CACHES_NO)]
     SHORT_LOCKS = [RLock() for _ in range(SHORT_CACHES_NO)]
+    plugins = [DiskUsage(RTR_PLUGINS_DISK_USAGE_PATHS)]
 
     @staticmethod
     async def update_global(new_global):
@@ -220,6 +223,13 @@ async def handle_register(req, websocket):
             data = await Cached.get_global()
             torrents = await Cached.get_torrents()
             result = {'global': data.__dict__, 'torrents': [t.__dict__ for t in torrents]}
+            plugins_data = {}
+            for plugin in Cached.plugins:
+                plugin_output = await plugin.get(False)
+                if plugin_output is not None:
+                    plugins_data[plugin.name()] = plugin_output
+            if plugins_data:
+                result['plugins'] = plugins_data
             result = Cached.filter_by_view(result, view_name)
             response_json = get_json_response(req['id'], result)
             return response_json
@@ -253,6 +263,13 @@ async def global_data_updater():
             diff = await Cached.update_torrents(data)
             if diff:
                 new_data['torrents'] = diff
+            plugins_data = {}
+            for plugin in Cached.plugins:
+                plugin_output = await plugin.get(False)
+                if plugin_output is not None:
+                    plugins_data[plugin.name()] = plugin_output
+            if plugins_data:
+                new_data['plugins'] = plugins_data
             if len(new_data) > 0:
                 await Cached.notify_clients(new_data)
         except Exception as e:

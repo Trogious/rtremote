@@ -73,7 +73,6 @@ class Peer:
             peers.append(p)
             add_attribute(p, params, record)
         return peers
-    pass
 
 
 class File:

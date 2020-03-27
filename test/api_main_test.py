@@ -72,11 +72,3 @@ def test_api_11_global():
     if g.system_api_version >= 11:
         values = {cmd.replace('.', '_') for cmd in Remote.COMMANDS_PER_API_VERSION[11]}
         assert len(g.__dict__.keys() & values) == len(values)
-
-
-if __name__ == '__main__':
-    test_global_data()
-    test_torrents()
-    test_trackers()
-    test_files()
-    test_peers()
