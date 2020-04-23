@@ -28,6 +28,7 @@ SOCK_PATH = getenv_path('RTR_SCGI_SOCKET_PATH', './.rtorrent.sock')
 RTR_PID_PATH = getenv_path('RTR_PID_PATH', './wss_server.pid')
 RTR_PLUGINS_DISK_USAGE_PATHS = os.getenv('RTR_PLUGINS_DISK_USAGE_PATHS', '/')
 logger = Logger.get_logger()
+RTR_VERSION = '__RTR_VERSION_PLACEHOLDER__'
 
 
 class Cached:
@@ -222,7 +223,7 @@ async def handle_register(req, websocket):
             await Cached.add_client(websocket, req['id'], view_name)
             data = await Cached.get_global()
             torrents = await Cached.get_torrents()
-            result = {'global': data.__dict__, 'torrents': [t.__dict__ for t in torrents]}
+            result = {'version': RTR_VERSION, 'global': data.__dict__, 'torrents': [t.__dict__ for t in torrents]}
             plugins_data = {}
             for plugin in Cached.plugins:
                 plugin_output = await plugin.get(False)

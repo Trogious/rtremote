@@ -95,6 +95,14 @@ jobs:
         RTDIR_V=${{github.event.repository.name}}-${{steps.prepare_release.outputs.tag_name}}
         RTDIR=$RTDIR_V/${{github.event.repository.name}}
         mkdir -p $RTDIR/plugins
+        RT_GIT_COMMITID=`git rev-parse --short HEAD | tr -d "\n" | sed 's/ //g'`
+        RT_GIT_TAG=`git tag --points-at $RT_GIT_COMMITID | tr -d "\n" | sed 's/ //g'`
+        if [ -n "$RT_GIT_TAG" ]; then
+          RT_VERSION="$RT_GIT_TAG"
+        else
+          RT_VERSION="git-$RT_GIT_COMMITID"
+        fi
+        sed -i "s/__RTR_VERSION_PLACEHOLDER__/$RT_VERSION/" server_wss.py
         for f in diffs.py model.py remote.py rpc.py scgi.py server_wss.py utils.py; do pyminify $f > $RTDIR/$f; done
         for f in plugins/*.py; do pyminify $f > $RTDIR/$f; done
         sed 's/server_wss\.py/${{github.event.repository.name}}.pyz/' ./start.sh > $RTDIR_V/start.sh
