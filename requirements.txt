@@ -1,4 +1,4 @@
 xmljson==0.2.0
 pynetstring==0.2
-websockets==8.1
+websockets==9.1
 cachetools==4.0.0
