@@ -366,7 +366,9 @@ async def global_data_updater(ready):
                 new_data['plugins'] = plugins_data
             if not ready.is_set():
                 ready.set()
-                logger.info('initial rtorrent snapshot fetched')
+                g = await Cached.get_global()
+                logger.info('initial rtorrent snapshot fetched (rtorrent %s, api %s)'
+                            % (getattr(g, 'system_client_version', '?'), getattr(g, 'system_api_version', '?')))
             elif len(new_data) > 0:
                 await Cached.notify_clients(new_data)
         except Exception as e:

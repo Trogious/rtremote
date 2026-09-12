@@ -135,5 +135,8 @@ class RTorrentRpc:
     def global_data(self, commands):
         g = Global()
         data = self.system_multicall(commands)
-        g.add_attributes(data, commands)
+        try:
+            g.add_attributes(data, commands)
+        except ValueError as e:
+            raise RpcError(str(e))
         return g

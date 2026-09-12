@@ -7,6 +7,11 @@ def extract_value(value):
 
 
 def add_attribute(obj, params, record):
+    if not isinstance(record, dict) or 'array' not in record:
+        # system.multicall answers a failing command with a fault struct in place
+        # of the value array - typically a command this rtorrent does not have
+        raise ValueError('rtorrent rejected command(s) %s (rtremote requires rtorrent >= 0.16): %.200r'
+                         % (params, record))
     r = record['array']['data']['value']
     if not isinstance(r, list):  # single value is not wrapped in a list
         r = [r]

@@ -1,68 +1,55 @@
 from rpc import RTorrentRpc
 
-# from utils import jl
-
 
 class Remote:
-    # minimum API_VERSION supported: 9
+    # Requires rtorrent >= 0.16 (system.api_version >= 26). rtorrent 0.9.x is NOT
+    # supported by this version; rtremote v1.5.0 is the last release for 0.9.x.
     #
-    # 'network.total_handshakes', 'network.open_files', 'throttle.max_unchoked_uploads', 'throttle.max_unchoked_downloads'
-    # available since: https://github.com/rakshasa/rtorrent/pull/937
-    GLOBAL_COMMANDS_PER_API_VERSION = {
-        10: ['network.http.current_open'],
-        11: ['network.total_handshakes', 'network.open_files', 'throttle.max_unchoked_uploads', 'throttle.max_unchoked_downloads']
+    # The JSON field names are part of the Android app protocol and must stay
+    # stable, so rtorrent commands that were renamed in 0.16 are requested under
+    # their new names and aliased back to the field names the app knows.
+    GLOBAL_COMMANDS = [
+        'throttle.global_down.rate', 'throttle.global_up.rate', 'throttle.global_down.max_rate', 'throttle.global_up.max_rate',
+        'network.max_open_files', 'throttle.max_downloads', 'throttle.max_uploads', 'network.http.max_total_connections',
+        'network.open_sockets', 'network.max_open_sockets', 'throttle.unchoked_uploads', 'throttle.unchoked_downloads',
+        'network.listen.port', 'network.listen.port.range', 'system.client_version', 'system.library_version', 'system.hostname',
+        'system.pid', 'system.cwd', 'session.path', 'system.api_version',
+        'network.http.current_open', 'network.total_handshakes', 'network.open_files',
+        'throttle.max_unchoked_uploads', 'throttle.max_unchoked_downloads',
+    ]
+    # attribute produced by the rtorrent command -> wire field name the app expects
+    GLOBAL_ALIASES = {
+        'network_listen_port_range': 'network_port_range',
+        'network_http_max_total_connections': 'network_http_max_open',
     }
-    TORRENT_COMMANDS_PER_API_VERSION = {
-        11: ['d.has_active_not_scrape=']
+    TORRENT_ALIASES = {
+        'tracker_has_active_not_scrape': 'has_active_not_scrape',
     }
-    API_VERSION = -1
 
     def __init__(self, sock_path):
         self.sock_path = sock_path
         self.rpc = RTorrentRpc(sock_path)
 
     @staticmethod
-    def append_commands_per_version(commands, commands_per_version):
-        for api_version in commands_per_version.keys():
-            if api_version <= Remote.API_VERSION:
-                commands += commands_per_version[api_version]
+    def apply_aliases(obj, aliases):
+        for attr, wire_name in aliases.items():
+            obj.__dict__[wire_name] = obj.__dict__.pop(attr)
 
     def get_global(self):
-        if Remote.API_VERSION < 0:
-            g = self.rpc.global_data(['system.api_version'])
-            Remote.API_VERSION = g.system_api_version
-        commands = ['throttle.global_down.rate', 'throttle.global_up.rate', 'throttle.global_down.max_rate', 'throttle.global_up.max_rate',
-                    'network.max_open_files', 'throttle.max_downloads', 'throttle.max_uploads', 'network.http.max_open',
-                    'network.open_sockets', 'network.max_open_sockets', 'throttle.unchoked_uploads', 'throttle.unchoked_downloads',
-                    'network.listen.port', 'network.port_range', 'system.client_version', 'system.library_version', 'system.hostname',
-                    'system.pid', 'system.cwd', 'session.path']
-        Remote.append_commands_per_version(commands, Remote.GLOBAL_COMMANDS_PER_API_VERSION)
-        g = self.rpc.global_data(commands)
-        g.system_api_version = Remote.API_VERSION
+        g = self.rpc.global_data(Remote.GLOBAL_COMMANDS)
+        Remote.apply_aliases(g, Remote.GLOBAL_ALIASES)
         return g
 
     def get_torrents(self, view='main'):
         params = ['d.hash=', 'd.name=', 'd.size_bytes=', 'd.bytes_done=', 'd.complete=', 'd.up.rate=', 'd.down.rate=', 'd.up.total=',
                   'd.down.total=', 'd.ratio=', 'd.size_files=', 'd.tracker_size=', 'd.peers_connected=', 'd.tied_to_file=',
                   'd.ignore_commands=', 'd.is_open=', 'd.is_active=', 'd.hashing=', 'd.is_hash_checking=', 'd.chunks_hashed=', 'd.message=',
-                  'd.size_chunks=', 'd.completed_chunks=']
-        Remote.append_commands_per_version(params, Remote.TORRENT_COMMANDS_PER_API_VERSION)
+                  'd.size_chunks=', 'd.completed_chunks=', 'd.tracker.has_active_not_scrape=']
         torrents = self.rpc.d_multicall(params, view)
         for t in torrents:
-            if hasattr(t, 'has_active_not_scrape'):
-                if t.has_active_not_scrape == 1:
-                    t.trackers = [x.__dict__ for x in Remote.optimize_trackers_digest(self.get_trackers_digest(t.hash))]
-            else:
-                trackers = self.get_trackers_digest(t.hash)
-                found_has_active_not_scrape = False
-                for tracker in trackers:
-                    if tracker.is_busy_not_scrape == 1:
-                        found_has_active_not_scrape = True
-                        break
-                # add all only if at least one is_busy_not_scrape==1
-                if found_has_active_not_scrape:
-                    t.trackers = [x.__dict__ for x in Remote.optimize_trackers_digest(trackers)]
-                t.__setattr__('has_active_not_scrape', 1 if found_has_active_not_scrape else 0)
+            Remote.apply_aliases(t, Remote.TORRENT_ALIASES)
+            if t.has_active_not_scrape == 1:
+                t.trackers = [x.__dict__ for x in Remote.optimize_trackers_digest(self.get_trackers_digest(t.hash))]
         return torrents
 
     def get_torrents_hashes(self, view):
