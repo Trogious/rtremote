@@ -1,14 +1,16 @@
 """A fake rtorrent SCGI/XML-RPC server for testing rtremote without rtorrent.
 
-Speaks just enough of rtorrent's XML-RPC dialect for server_wss.py:
-- system.multicall (global getters)
+Mimics rtorrent 0.16.x: current command names (network.listen.port.range,
+network.http.max_total_connections, d.tracker.has_active_not_scrape),
+system.api_version 26 and the tinyxml2 compact XML output style (empty results
+are a childless <data/>).
+
+Speaks just enough of the XML-RPC dialect for server_wss.py:
+- system.multicall (global getters; unknown commands answer with a fault
+  struct in place of the value array, like the real thing)
 - d.multicall2 / t.multicall / p.multicall / f.multicall
 - plain getters and *.set setters (for update-propagation tests)
 - fake.add_torrent / fake.remove_torrent control methods
-
-Response XML mimics both real formatting styles, selected per instance:
-- pretty=True: xmlrpc-c style (rtorrent 0.9.x) - whitespace inside empty <data>
-- pretty=False: tinyxml2 compact style (rtorrent >= 0.10) - <data/>
 """
 import os
 import socketserver
@@ -24,6 +26,14 @@ def _fault(code, string):
             '</struct></value></fault></methodResponse>' % (code, escape(string)))
 
 
+def _fault_struct(code, string):
+    # per-command fault inside a system.multicall response
+    return ('<value><struct>'
+            '<member><name>faultCode</name><value><i4>%d</i4></value></member>'
+            '<member><name>faultString</name><value><string>%s</string></value></member>'
+            '</struct></value>' % (code, escape(string)))
+
+
 def _response(inner):
     return '<?xml version="1.0"?><methodResponse><params><param>%s</param></params></methodResponse>' % inner
 
@@ -32,9 +42,9 @@ class State:
     def __init__(self):
         self.lock = threading.RLock()
         self.globals = {
-            'system.api_version': 10,
-            'system.client_version': '0.9.8',
-            'system.library_version': '0.13.8',
+            'system.api_version': 26,
+            'system.client_version': '0.16.22',
+            'system.library_version': '0.16.22',
             'system.hostname': 'fakehost',
             'system.pid': 4242,
             'system.cwd': '/fake/cwd',
@@ -43,17 +53,21 @@ class State:
             'throttle.global_up.rate': 0,
             'throttle.global_down.max_rate': 1024,
             'throttle.global_up.max_rate': 1024,
-            'network.max_open_files': 8000,
+            'network.max_open_files': 4096,
             'throttle.max_downloads': 50,
             'throttle.max_uploads': 50,
-            'network.http.max_open': 32,
+            'network.http.max_total_connections': 32,
             'network.open_sockets': 3,
-            'network.max_open_sockets': 999,
+            'network.max_open_sockets': 1048576,
             'throttle.unchoked_uploads': 0,
             'throttle.unchoked_downloads': 0,
             'network.listen.port': 22400,
-            'network.port_range': '22400-22400',
+            'network.listen.port.range': '22400-22400',
             'network.http.current_open': 0,
+            'network.total_handshakes': 0,
+            'network.open_files': 0,
+            'throttle.max_unchoked_uploads': 2,
+            'throttle.max_unchoked_downloads': 2,
         }
         # keyed by info hash; field names are rtorrent command names
         self.torrents = {}
@@ -62,7 +76,7 @@ class State:
         self.files = {}
 
     def add_torrent(self, hash, name, size, complete=0, is_open=1, is_active=1,
-                    down_rate=0, up_rate=0, trackers=None):
+                    down_rate=0, up_rate=0, trackers=None, has_active_not_scrape=0):
         with self.lock:
             self.torrents[hash] = {
                 'd.hash': hash, 'd.name': name, 'd.size_bytes': size,
@@ -75,7 +89,7 @@ class State:
                 'd.hashing': 0, 'd.is_hash_checking': 0, 'd.chunks_hashed': 0,
                 'd.message': '', 'd.size_chunks': 100,
                 'd.completed_chunks': 100 if complete else 50,
-                'd.has_active_not_scrape': 0,
+                'd.tracker.has_active_not_scrape': has_active_not_scrape,
             }
             self.trackers[hash] = trackers or []
             self.peers[hash] = []
@@ -113,6 +127,7 @@ class State:
                                     't.is_enabled': 1, 't.scrape_complete': 10, 't.scrape_incomplete': 2,
                                     't.scrape_downloaded': 100, 't.latest_new_peers': 3, 't.latest_sum_peers': 8}])
         self.add_torrent('B' * 40, 'bravo.iso', 2000000, complete=0, is_open=0, is_active=0,
+                         has_active_not_scrape=1,
                          trackers=[{'t.group': 0, 't.url': 'http://tr2.example.org:8080/announce',
                                     't.is_busy': 1, 't.latest_event': 1, 't.id': 'xyz', 't.failed_counter': 1,
                                     't.success_counter': 3, 't.scrape_counter': 1, 't.is_usable': 1,
@@ -148,9 +163,8 @@ def _parse_params(params_el):
 
 
 class Responder:
-    def __init__(self, state, pretty=True):
+    def __init__(self, state):
         self.state = state
-        self.pretty = pretty
 
     def value(self, v):
         if isinstance(v, str):
@@ -159,8 +173,7 @@ class Responder:
 
     def array(self, values_xml):
         if not values_xml:
-            return ('<value><array><data>\n</data></array></value>' if self.pretty
-                    else '<value><array><data/></array></value>')
+            return '<value><array><data/></array></value>'
         return '<value><array><data>%s</data></array></value>' % ''.join(values_xml)
 
     def row(self, fields, commands):
@@ -181,7 +194,10 @@ class Responder:
             for call in params[0]:
                 name = call['methodName']
                 with state.lock:
-                    results.append(self.array([self.value(state.globals.get(name, 0))]))
+                    if name in state.globals:
+                        results.append(self.array([self.value(state.globals[name])]))
+                    else:
+                        results.append(_fault_struct(-506, "Method '%s' not defined" % name))
             return _response(self.array(results))
 
         if method == 'd.multicall2':
@@ -273,13 +289,13 @@ class ScgiHandler(socketserver.BaseRequestHandler):
 
 
 class FakeRtorrent:
-    def __init__(self, sock_path, state=None, pretty=True):
+    def __init__(self, sock_path, state=None):
         self.sock_path = sock_path
         self.state = state if state is not None else State()
         if os.path.exists(sock_path):
             os.remove(sock_path)
         self.server = socketserver.ThreadingUnixStreamServer(sock_path, ScgiHandler)
-        self.server.responder = Responder(self.state, pretty)
+        self.server.responder = Responder(self.state)
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
 
     def start(self):

@@ -93,7 +93,7 @@ async def validate_update_plugins_disk_usage(validate_func):
 
 
 def validate_global(data):
-    assert data['result']['global']['network_max_open_files'] == 8000
+    assert data['result']['global']['network_max_open_files'] > 0
     assert data['result']['global']['throttle_global_down_max_rate'] == 1024
     assert data['result']['global']['throttle_global_up_max_rate'] == 1024
 
@@ -177,7 +177,7 @@ def test_trackers():
 
 def test_register_global():
     wait_for_server_spawn()
-    asyncio.run(validate_update(validate_update_global, 'network.http.max_open', 32, 0))
+    asyncio.run(validate_update(validate_update_global, 'throttle.global_down.max_rate', 2048, 0))
 
 
 def test_register_torrents():

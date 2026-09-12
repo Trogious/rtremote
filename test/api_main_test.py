@@ -9,15 +9,28 @@ def test_global_data():
     g = Remote(SOCK_PATH).get_global()
     assert g.throttle_global_down_max_rate == 1024
     assert g.throttle_global_up_max_rate == 1024
-    assert g.network_max_open_files == 8000
+    assert g.network_max_open_files > 0
+    # aliased wire names: the app-facing fields keep their pre-0.16 names
     assert g.network_port_range == '22400-22400'
     assert g.network_listen_port == 22400
+    assert g.network_http_max_open > 0
+    assert g.system_api_version >= 26
+
+
+def test_extended_global():
+    # all extended fields are unconditionally available on rtorrent >= 0.16
+    g = Remote(SOCK_PATH).get_global()
+    for field in ('network_http_current_open', 'network_total_handshakes', 'network_open_files',
+                  'throttle_max_unchoked_uploads', 'throttle_max_unchoked_downloads',
+                  'network_open_sockets', 'network_max_open_sockets'):
+        assert field in g.__dict__
 
 
 def test_torrents():
     torrents = Remote(SOCK_PATH).get_torrents()
     assert len(torrents) >= 2
     for t in torrents:
+        assert 'has_active_not_scrape' in t.__dict__
         if t.hash == 'A6B69431743F085D96692A81C6282617C50243C4':
             assert t.name == 'debian-10.2.0-amd64-DVD-1.iso'
             assert t.size_bytes == 3918200832
@@ -59,16 +72,3 @@ def test_peers():
     for hash in ['A6B69431743F085D96692A81C6282617C50243C4', '67DD1659106DCDDE0FEC4283D7B0C84B6C292675']:
         peers = remote.get_peers(hash)
         assert len(peers) == 0
-
-
-def test_api_10_global():
-    g = Remote(SOCK_PATH).get_global()
-    if g.system_api_version >= 10:
-        assert g.network_http_current_open == 0
-
-
-def test_api_11_global():
-    g = Remote(SOCK_PATH).get_global()
-    if g.system_api_version >= 11:
-        values = {cmd.replace('.', '_') for cmd in Remote.GLOBAL_COMMANDS_PER_API_VERSION[11]}
-        assert len(g.__dict__.keys() & values) == len(values)

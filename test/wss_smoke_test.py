@@ -5,8 +5,8 @@ server_wss.py in an isolated temp directory, then exercises the full protocol:
 registration per view, detail requests, diff pushes, per-view filtering of new
 torrents, error handling, and updater resilience to an rtorrent outage.
 
-Runs twice: once with pretty-printed XML (rtorrent 0.9.x style) and once with
-compact XML (rtorrent >= 0.10 style).
+The fake mimics rtorrent 0.16.x (current command names, api_version 26,
+compact tinyxml2 XML), matching what this server version requires.
 """
 import asyncio
 import hashlib
@@ -35,15 +35,14 @@ PUSH_TIMEOUT = INTERVAL + 4
 
 
 class Server:
-    def __init__(self, tmp, pretty):
+    def __init__(self, tmp):
         self.tmp = tmp
         self.sock_path = os.path.join(tmp, 'fake.sock')
         self.pid_path = os.path.join(tmp, 'server.pid')
         self.log_path = os.path.join(tmp, 'server.log')
         self.state = State()
         self.state.populate_default()
-        self.pretty = pretty
-        self.fake = FakeRtorrent(self.sock_path, self.state, pretty)
+        self.fake = FakeRtorrent(self.sock_path, self.state)
         self.port = None
         self.pid = None
 
@@ -55,7 +54,7 @@ class Server:
         return RTorrentRpc(self.sock_path)
 
     def restart_fake(self):
-        self.fake = FakeRtorrent(self.sock_path, self.state, self.pretty)
+        self.fake = FakeRtorrent(self.sock_path, self.state)
         self.fake.start()
 
 
@@ -67,10 +66,10 @@ def _free_port():
     return port
 
 
-@pytest.fixture(scope='module', params=['pretty', 'compact'])
+@pytest.fixture(scope='module')
 def srv(request):
     tmp = tempfile.mkdtemp(prefix='rtr_smoke_')
-    server = Server(tmp, pretty=(request.param == 'pretty'))
+    server = Server(tmp)
     server.fake.start()
     server.port = _free_port()
     env = dict(os.environ)
@@ -193,7 +192,8 @@ def test_register_main(srv):
         assert 'version' in result
         assert result['global']['throttle_global_down_max_rate'] == 1024
         assert result['global']['network_http_max_open'] == 32
-        assert result['global']['system_api_version'] == 10
+        assert result['global']['system_api_version'] == 26
+        assert result['global']['network_port_range'] == '22400-22400'
         hashes = [t['hash'] for t in result['torrents']]
         assert hashes == [HASH_A, HASH_B]
         torrent_b = result['torrents'][1]
@@ -252,12 +252,12 @@ def test_no_pushes_when_idle(srv):
 def test_global_change_push(srv):
     async def run():
         ws, _ = await _connect(srv)
-        srv.rpc().call('network.http.max_open.set', [('string', ''), ('i8', 33)])
+        srv.rpc().call('network.http.max_total_connections.set', [('string', ''), ('i8', 33)])
         try:
             frame = await _wait_for(ws, lambda f: 'global' in f['result'])
             assert frame['result']['global']['network_http_max_open'] == 33
         finally:
-            srv.rpc().call('network.http.max_open.set', [('string', ''), ('i8', 32)])
+            srv.rpc().call('network.http.max_total_connections.set', [('string', ''), ('i8', 32)])
         await ws.close()
     asyncio.run(run())
 
@@ -368,11 +368,11 @@ def test_survives_rtorrent_outage(srv):
         srv.fake.stop()
         await asyncio.sleep(INTERVAL * 2.5)  # let a few polls fail
         srv.restart_fake()
-        srv.rpc().call('network.http.max_open.set', [('string', ''), ('i8', 40)])
+        srv.rpc().call('network.http.max_total_connections.set', [('string', ''), ('i8', 40)])
         try:
             frame = await _wait_for(ws, lambda f: 'global' in f['result'], timeout=PUSH_TIMEOUT + INTERVAL * 2)
             assert frame['result']['global']['network_http_max_open'] == 40
         finally:
-            srv.rpc().call('network.http.max_open.set', [('string', ''), ('i8', 32)])
+            srv.rpc().call('network.http.max_total_connections.set', [('string', ''), ('i8', 32)])
         await ws.close()
     asyncio.run(run())
