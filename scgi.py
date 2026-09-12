@@ -1,6 +1,12 @@
+import os
 import socket
 
-import pynetstring
+# per-socket-operation timeout; guards against a hung rtorrent blocking forever
+RTR_SCGI_TIMEOUT = int(os.getenv('RTR_SCGI_TIMEOUT', 30))
+
+
+def netstring(data):
+    return str(len(data)).encode('ascii') + b':' + data + b','
 
 
 class Scgi:
@@ -16,30 +22,46 @@ class Scgi:
 
     @staticmethod
     def get_headers(content_len, method='POST'):
+        # CONTENT_LENGTH must be the first header: rtorrent rejects the request otherwise
         h = Scgi.get_header('CONTENT_LENGTH', content_len)
-        h += Scgi.get_header('Scgi', 1)
+        h += Scgi.get_header('SCGI', 1)
         h += Scgi.get_header('REQUEST_METHOD', method)
         h += Scgi.get_header('REQUEST_URI', '/RPC2')
-        h = pynetstring.encode(h)
-        return h
+        return netstring(h)
 
     def get_connected_socket(self):
         if self.host_port.startswith('inet:'):
+            host, _, port = self.host_port[len('inet:'):].rpartition(':')
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            host_port = self.host_port.replace('inet:', '').split(':')
-            sock.connect(host_port)
+            addr = (host, int(port))
         else:
+            path = self.host_port
+            for prefix in ('unix:', 'local:'):
+                if path.startswith(prefix):
+                    path = path[len(prefix):]
+                    break
             sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-            sock.connect(self.host_port.replace('unix:', '').replace('local:', ''))
+            addr = path
+        sock.settimeout(RTR_SCGI_TIMEOUT)
+        try:
+            sock.connect(addr)
+        except BaseException:
+            sock.close()
+            raise
         return sock
 
     def post(self, body):
-        req = Scgi.get_headers(len(body)) + body.encode(Scgi.ENCODING)
+        payload = body.encode(Scgi.ENCODING)
+        req = Scgi.get_headers(len(payload)) + payload
         sock = self.get_connected_socket()
-        sock.sendall(req)
-        r = sock.recv(Scgi.BUFSIZE)
-        resp = b''
-        while len(r) > 0:
-            resp += r
-            r = sock.recv(Scgi.BUFSIZE)
-        return resp.decode(Scgi.ENCODING)
+        try:
+            sock.sendall(req)
+            chunks = []
+            while True:
+                r = sock.recv(Scgi.BUFSIZE)
+                if not r:
+                    break
+                chunks.append(r)
+        finally:
+            sock.close()
+        return b''.join(chunks).decode(Scgi.ENCODING)

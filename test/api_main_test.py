@@ -70,5 +70,5 @@ def test_api_10_global():
 def test_api_11_global():
     g = Remote(SOCK_PATH).get_global()
     if g.system_api_version >= 11:
-        values = {cmd.replace('.', '_') for cmd in Remote.COMMANDS_PER_API_VERSION[11]}
+        values = {cmd.replace('.', '_') for cmd in Remote.GLOBAL_COMMANDS_PER_API_VERSION[11]}
         assert len(g.__dict__.keys() & values) == len(values)

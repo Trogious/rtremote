@@ -1,9 +1,14 @@
 from xml.etree.ElementTree import fromstring
+from xml.sax.saxutils import escape
 
 from xmljson import parker
 
 from model import File, Global, Peer, Torrent, Tracker
 from scgi import Scgi
+
+
+class RpcError(Exception):
+    """rtorrent returned a fault, or the response could not be parsed."""
 
 
 class RTorrentRpc:
@@ -12,6 +17,8 @@ class RTorrentRpc:
 
     @staticmethod
     def extract_params(args):
+        # generic helper for ad-hoc calls (tests, tooling): guesses the XML-RPC
+        # type from the value; plain digit strings become i8
         params = []
         for p in args:
             param = p.split(':')
@@ -28,22 +35,56 @@ class RTorrentRpc:
                 params.append(('string', param[0]))
         return params
 
-    def call(self, method, params=None):
-        body = "<?xml version='1.0'?><methodCall><methodName>" + \
-            method + "</methodName><params>"
-        if params:
-            for p in params:
-                body += '<param><value><' + p[0] + '>' + str(p[1]) + '</' + p[0] + '></value></param>'
-        body += "</params></methodCall>"
+    @staticmethod
+    def string_params(args):
+        # multicall arguments (target hash, view, commands) are always strings;
+        # never guess types for them, or a numeric-looking info hash breaks the call
+        return [('string', a) for a in args]
+
+    @staticmethod
+    def _param_xml(p):
+        tag, value = p
+        if tag == 'string':
+            value = escape(str(value))
+        return '<param><value><%s>%s</%s></value></param>' % (tag, value, tag)
+
+    def _post(self, body):
         scgi = Scgi(self.host_port)
         resp = scgi.post(body)
-        resp = resp[resp.find('<'):]  # strip headers
-        # print(resp)
-        data = parker.data(fromstring(resp), preserve_root=True)  # convert to json
+        start = resp.find('<')
+        if start < 0:
+            raise RpcError('no XML found in SCGI response')
+        data = parker.data(fromstring(resp[start:]), preserve_root=True)  # convert to json
+        RTorrentRpc._check_fault(data)
         return data
 
+    @staticmethod
+    def _check_fault(data):
+        method_response = data.get('methodResponse') if isinstance(data, dict) else None
+        if isinstance(method_response, dict) and 'fault' in method_response:
+            code, string = None, None
+            try:
+                members = method_response['fault']['value']['struct']['member']
+                for m in members:
+                    if m['name'] == 'faultCode':
+                        code = next(iter(m['value'].values()))
+                    elif m['name'] == 'faultString':
+                        string = next(iter(m['value'].values()))
+            except Exception:
+                pass
+            raise RpcError('rtorrent fault %s: %s' % (code, string))
+
+    def call(self, method, params=None):
+        body = "<?xml version='1.0'?><methodCall><methodName>" + \
+            escape(method) + "</methodName><params>"
+        if params:
+            for p in params:
+                body += RTorrentRpc._param_xml(p)
+        body += "</params></methodCall>"
+        return self._post(body)
+
     def get_struct(self, command):
-        s = '<struct><member><name>methodName</name><value><string>' + command + \
+        s = '<struct><member><name>methodName</name><value><string>' + escape(command) + \
             '</string></value></member><member><name>params</name><value><array><data></data></array></value></member></struct>'
         return s
 
@@ -53,12 +94,7 @@ class RTorrentRpc:
             for c in commands:
                 body += '<value>' + self.get_struct(c) + '</value>'
         body += "</data></array></value></param></params></methodCall>"
-        scgi = Scgi(self.host_port)
-        resp = scgi.post(body)
-        resp = resp[resp.find('<'):]  # strip headers
-        # print(resp)
-        data = parker.data(fromstring(resp), preserve_root=True)  # convert to json
-        return data
+        return self._post(body)
 
     def list_methods(self, params=None):
         data = self.call('system.listMethods', params)
@@ -68,14 +104,16 @@ class RTorrentRpc:
         return methods
 
     def multicall(self, method, args):
-        data = self.call(method, RTorrentRpc.extract_params(args))
-        data = data['methodResponse']['params']['param']['value']['array']['data']  # TODO: add 'fault' handling
-        if 'value' in data:
-            data = data['value']
-            if 'array' in data:
-                data = [data]
-        else:
-            data = []
+        data = self.call(method, RTorrentRpc.string_params(args))
+        data = data['methodResponse']['params']['param']['value']['array']['data']
+        # an empty result is a childless <data> element: parker turns it into
+        # None (compact XML, rtorrent >= 0.10) or a whitespace string (pretty-
+        # printed XML, rtorrent 0.9.x)
+        if not isinstance(data, dict) or 'value' not in data:
+            return []
+        data = data['value']
+        if isinstance(data, dict):  # single row is not wrapped in a list
+            data = [data]
         return data
 
     def d_multicall(self, commands, view):

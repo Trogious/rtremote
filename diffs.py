@@ -1,6 +1,3 @@
-from utils import Logger
-
-
 def map_diff(old, new):
     diff = {}
     for key in old.keys():

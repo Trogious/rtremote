@@ -1,17 +1,18 @@
 #!/usr/bin/env python3
+"""Minimal ad-hoc WSS client for smoke testing a running rtremote server."""
 import asyncio
 import json
 import ssl
 
-import websockets
+from websockets.asyncio.client import connect
 
-CERT_PATH = './cert/cert.pem'
 
-ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLSv1_2)
-# localhost_pem = pathlib.Path(__file__).with_name(CERT_PATH)
-# ssl_context.load_verify_locations(localhost_pem)
-# ssl_context.check_hostname = False
-# ssl_context.verify_mode = ssl.CERT_NONE
+def get_ssl_context():
+    # test client for a self-signed local server: no certificate verification
+    ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    ssl_context.check_hostname = False
+    ssl_context.verify_mode = ssl.CERT_NONE
+    return ssl_context
 
 
 def get_json_request():
@@ -33,15 +34,15 @@ def get_json_request_files(method='get_files'):
 
 
 async def hello():
-    uri = "wss://127.0.0.1:8765"
-    async with websockets.connect(uri, ssl=ssl_context) as websocket:
+    uri = 'wss://127.0.0.1:8765'
+    async with connect(uri, ssl=get_ssl_context()) as websocket:
         await websocket.send(get_json_request())
         await websocket.send(get_json_request_files())
         await websocket.send(get_json_request_files('get_trackers'))
         await websocket.send(get_json_request_files('get_peers'))
         async for m in websocket:
-            greeting = m  # await websocket.recv()
-            print(greeting)
+            print(m)
 
-asyncio.get_event_loop().run_until_complete(hello())
-# asyncio.get_event_loop().run_forever()
+
+if __name__ == '__main__':
+    asyncio.run(hello())

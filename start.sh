@@ -1,4 +1,6 @@
 #!/bin/sh -
+# NOTE: for any real deployment set your own RTR_SECRET_KEY_SHA1 (printf '%s' 'yoursecret' | sha1sum)
+# and generate your own certificate (cert/howto.txt) - the bundled cert/ material is public test data.
 RTR_ROOT=`pwd`
 /usr/bin/env \
   RTR_CERT_PATH="$RTR_ROOT/cert/cert.pem" \

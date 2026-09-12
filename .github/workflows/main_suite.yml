@@ -6,16 +6,17 @@ jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v2
-    - name: set up Python 3.7
-      uses: actions/setup-python@v1
+    - uses: actions/checkout@v4
+    - name: set up Python
+      uses: actions/setup-python@v5
       with:
-        python-version: 3.7
+        python-version: '3.12'
     - name: install dependencies
       run: |
         python -m pip install --upgrade pip
         pip install -r requirements.txt
         pip install pytest
+        command -v 7z >/dev/null || { sudo apt-get update && sudo apt-get install -y p7zip-full; }
     - name: 0.9.8
       env:
         PYTHONPATH: .
@@ -23,12 +24,14 @@ jobs:
         RTR_SYSTEM_CLIENT_VERSION: 0.9.8
         RTR_SYSTEM_API_VERSION: 10
       run: |
-        7zr e ./test/deps/rtorrent-0.9.8.7z
+        7z e -y ./test/deps/rtorrent-0.9.8.7z
+        chmod +x ./rtorrent-0.9.8
         ./rtorrent-0.9.8 -n -o system.daemon.set=true -o network.xmlrpc.size_limit.set=2097152 -o throttle.global_down.max_rate.set=1024 -o throttle.global_up.max_rate.set=1024 -o throttle.max_peers.normal.set=100 -o throttle.max_peers.seed.set=-1 -o throttle.max_uploads.global.set=100 -o throttle.min_peers.normal.set=1 -o throttle.min_peers.seed.set=2 -o encoding.add=UTF-8 -o network.port_random.set=no -o network.port_range.set=22400-22400 -o network.scgi.open_local=./.rtorrent.sock -o network.max_open_files.set=8000 -o file.prioritize_toc.set=1 -o load.normal='test/deps/torrents/*.torrent' &
         ./start.sh &
         pytest ./test
         wss_pid=`cat ./wss_server.pid`
         kill $wss_pid
+        sleep 1
         test -f ./wss_server.pid && kill -9 $wss_pid
         kill -9 `pidof rtorrent-0.9.8`
     - name: 0.9.7
@@ -38,16 +41,19 @@ jobs:
         RTR_SYSTEM_CLIENT_VERSION: 0.9.7
         RTR_SYSTEM_API_VERSION: 9
       run: |
-        7zr e ./test/deps/rtorrent-0.9.7.7z
+        7z e -y ./test/deps/rtorrent-0.9.7.7z
+        chmod +x ./rtorrent-0.9.7
         ./rtorrent-0.9.7 -n -o system.daemon.set=true -o network.xmlrpc.size_limit.set=2097152 -o throttle.global_down.max_rate.set=1024 -o throttle.global_up.max_rate.set=1024 -o throttle.max_peers.normal.set=100 -o throttle.max_peers.seed.set=-1 -o throttle.max_uploads.global.set=100 -o throttle.min_peers.normal.set=1 -o throttle.min_peers.seed.set=2 -o encoding.add=UTF-8 -o network.port_random.set=no -o network.port_range.set=22400-22400 -o network.scgi.open_local=./.rtorrent.sock -o network.max_open_files.set=8000 -o file.prioritize_toc.set=1 -o load.normal='test/deps/torrents/*.torrent' &
         ./start.sh &
         pytest ./test
         wss_pid=`cat ./wss_server.pid`
         kill $wss_pid
+        sleep 1
         test -f ./wss_server.pid && kill -9 $wss_pid
         kill -9 `pidof rtorrent-0.9.7`
     - name: setup env 0.9.6
       run: |
+        command -v screen >/dev/null || { sudo apt-get update && sudo apt-get install -y screen; }
         mkdir -p ~/.terminfo/s
         cp ./test/deps/xterm ~/.terminfo/s/screen
         sudo mkdir -p /run/screen
@@ -60,49 +66,40 @@ jobs:
         RTR_SYSTEM_CLIENT_VERSION: 0.9.6
         RTR_SYSTEM_API_VERSION: 9
       run: |
-        7zr e ./test/deps/rtorrent-0.9.6.7z
+        7z e -y ./test/deps/rtorrent-0.9.6.7z
+        chmod +x ./rtorrent-0.9.6
         screen -dm ./rtorrent-0.9.6 -n -o network.xmlrpc.size_limit.set=2097152 -o throttle.global_down.max_rate.set=1024 -o throttle.global_up.max_rate.set=1024 -o throttle.max_peers.normal.set=100 -o throttle.max_peers.seed.set=-1 -o throttle.max_uploads.global.set=100 -o throttle.min_peers.normal.set=1 -o throttle.min_peers.seed.set=2 -o encoding.add=UTF-8 -o network.port_random.set=no -o network.port_range.set=22400-22400 -o network.scgi.open_local=./.rtorrent.sock -o network.max_open_files.set=8000 -o file.prioritize_toc.set=1 -o load.normal='test/deps/torrents/*.torrent'
         ./start.sh &
         pytest ./test
         wss_pid=`cat ./wss_server.pid`
         kill $wss_pid
+        sleep 1
         test -f ./wss_server.pid && kill -9 $wss_pid
         kill -9 `pidof rtorrent-0.9.6`
   deploy:
     needs: test
-    if: contains(github.ref, 'tags/')
+    if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
-    - uses: actions/checkout@v2
-    - name: set up Python 3.7
-      uses: actions/setup-python@v1
+    - uses: actions/checkout@v4
+    - name: set up Python
+      uses: actions/setup-python@v5
       with:
-        python-version: 3.7
-    - name: prepare release
-      id: prepare_release
-      run: |
-        TAG_NAME=`echo $GITHUB_REF | cut -d / -f3`
-        echo ::set-output name=tag_name::$TAG_NAME
+        python-version: '3.12'
     - name: install dependencies
-      if: startsWith(steps.prepare_release.outputs.tag_name, 'v')
       run: |
         python -m pip install --upgrade pip
         pip install python-minifier
     - name: assemble package
-      id: asseemble_package
-      if: success()
+      id: assemble_package
       run: |
-        RTDIR_V=${{github.event.repository.name}}-${{steps.prepare_release.outputs.tag_name}}
+        TAG_NAME=${GITHUB_REF#refs/tags/}
+        RTDIR_V=${{github.event.repository.name}}-$TAG_NAME
         RTDIR=$RTDIR_V/${{github.event.repository.name}}
         mkdir -p $RTDIR/plugins
-        RT_GIT_COMMITID=`git rev-parse --short HEAD | tr -d "\n" | sed 's/ //g'`
-        RT_GIT_TAG=`git tag --points-at $RT_GIT_COMMITID | tr -d "\n" | sed 's/ //g'`
-        if [ -n "$RT_GIT_TAG" ]; then
-          RT_VERSION="$RT_GIT_TAG"
-        else
-          RT_VERSION="git-$RT_GIT_COMMITID"
-        fi
-        sed -i "s/__RTR_VERSION_PLACEHOLDER__/$RT_VERSION/" server_wss.py
+        sed -i "s/__RTR_VERSION_PLACEHOLDER__/$TAG_NAME/" server_wss.py
         for f in diffs.py model.py remote.py rpc.py scgi.py server_wss.py utils.py; do pyminify $f > $RTDIR/$f; done
         for f in plugins/*.py; do pyminify $f > $RTDIR/$f; done
         sed 's/server_wss\.py/${{github.event.repository.name}}.pyz/' ./start.sh > $RTDIR_V/start.sh
@@ -114,25 +111,8 @@ jobs:
         cd ..
         tar -czvf $RTDIR_V.tgz $RTDIR_V
         du -shc $RTDIR_V.tgz
-        echo ::set-output name=package_name::$RTDIR_V.tgz
-    - name: create release
-      id: create_release
-      if: steps.prepare_release.outputs.tag_name
-      uses: actions/create-release@v1
-      env:
-        GITHUB_TOKEN: ${{secrets.GITHUB_TOKEN}}
+        echo "package_name=$RTDIR_V.tgz" >> "$GITHUB_OUTPUT"
+    - name: create release and upload package
+      uses: softprops/action-gh-release@v2
       with:
-        tag_name: ${{steps.prepare_release.outputs.tag_name}}
-        release_name: Release ${{steps.prepare_release.outputs.tag_name}}
-        draft: false
-        prerelease: false
-    - name: upload package
-      if: steps.create_release.outputs.upload_url && steps.asseemble_package.outputs.package_name
-      uses: actions/upload-release-asset@v1.0.1
-      env:
-        GITHUB_TOKEN: ${{secrets.GITHUB_TOKEN}}
-      with:
-        upload_url: ${{steps.create_release.outputs.upload_url}}
-        asset_path: ./${{steps.asseemble_package.outputs.package_name}}
-        asset_name: ${{steps.asseemble_package.outputs.package_name}}
-        asset_content_type: application/gzip
+        files: ${{steps.assemble_package.outputs.package_name}}
