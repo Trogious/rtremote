@@ -10,10 +10,15 @@ How to run the `rtremote` WebSocket server next to your running rtorrent.
 Do not clone this repo, rather get a release from [here](https://github.com/Trogious/rtremote/releases). The repo contains tests and test dependencies you don't need.
 
 ### Requirements
-- rtorrent compiled with the `--with-xmlrpc-c` (or `--with-xmlrpc-tinyxml2`) flag
+- **rtorrent 0.16.x or newer**, compiled with XML-RPC support (`--with-xmlrpc-tinyxml2`)
 - rtorrent SCGI socket file, usually `.rtorrent.sock`
 - Python 3.9+
 - Python dependencies, installed with `pip install -r requirements.txt`
+
+**rtorrent 0.9.x is NOT supported by this version.** rtorrent 0.16 renamed several
+XML-RPC commands this server relies on; if you run rtorrent 0.9.x, use
+[rtremote v1.5.0](https://github.com/Trogious/rtremote/releases/tag/v1.5.0) - the
+last release compatible with it.
 
 ### Running
 - unpack and get into the rtremote directory

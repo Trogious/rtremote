@@ -21,8 +21,11 @@ connect to. It polls rtorrent on a fixed interval, computes deltas, and pushes
 only the changes out to every connected client — so the app gets near-realtime
 updates without the cost of re-sending the full state every tick.
 
-Requires **Python 3.9+**; pinned dependencies are `websockets` (15.x, the
-current `asyncio` API), `cachetools` and `xmljson`.
+Requires **Python 3.9+** and **rtorrent >= 0.16** (`system.api_version` >= 26).
+rtorrent 0.9.x is not supported: 0.16 renamed several XML-RPC commands this
+server depends on, and v2 dropped the old-name support entirely - rtremote
+v1.5.0 is the last release compatible with rtorrent 0.9.x. Pinned dependencies
+are `websockets` (15.x, the current `asyncio` API), `cachetools` and `xmljson`.
 
 ## How it works
 
@@ -142,21 +145,27 @@ change, so an idle client receives nothing.
     guessing would corrupt an all-digit info hash into an integer.
   - XML-RPC **faults raise `RpcError`**, which the WSS layer converts into a
     JSON-RPC error for the client.
-  - Empty multicall results parse to `None` (compact XML from modern
-    rtorrent's tinyxml2 backend, e.g. `<data/>`) or a whitespace string
-    (pretty-printed xmlrpc-c output from rtorrent 0.9.x); both are handled.
-    Relying on only one of the two styles is a known historical trap.
-- **`remote.py`** (`Remote`) — domain layer on top of the RPC. Knows which
-  rtorrent commands to fetch and adapts the set per detected
-  `system.api_version`:
-  - `GLOBAL_COMMANDS_PER_API_VERSION` adds extra global fields (e.g.
-    `network.total_handshakes`, `throttle.max_unchoked_uploads`) when rtorrent
-    is new enough.
-  - `TORRENT_COMMANDS_PER_API_VERSION` adds `d.has_active_not_scrape=` on
-    API 11+; for older versions the same flag is computed by iterating each
-    torrent's trackers and checking `is_busy && latest_event != EVENT_SCRAPE`.
-  This is the only place that branches on rtorrent version; the WSS layer is
-  version-agnostic.
+  - Empty multicall results are a childless `<data/>` in rtorrent 0.16's
+    compact tinyxml2 output and parse to `None`; the guard also tolerates the
+    whitespace text nodes older pretty-printing produced. Relying on one
+    specific style was a known historical trap.
+  - A command the running rtorrent does not know shows up as a per-command
+    fault struct inside the `system.multicall` response; `Global` parsing
+    turns that into an `RpcError` naming the command instead of a cryptic
+    `KeyError`, and the updater logs it and retries.
+- **`remote.py`** (`Remote`) — domain layer on top of the RPC. Holds the flat
+  command lists for the global snapshot and the torrent list (no rtorrent
+  version branching: 0.16+ has everything unconditionally). Crucially, it
+  keeps the **wire protocol stable across rtorrent renames**: the JSON field
+  names are part of the Android app contract, so commands renamed in rtorrent
+  0.16 are requested under their new names and aliased back:
+  - `network.listen.port.range` → field `network_port_range`
+  - `network.http.max_total_connections` → field `network_http_max_open`
+  - `d.tracker.has_active_not_scrape=` → field `has_active_not_scrape`
+  When that flag is 1, the torrent's tracker digest (group, url,
+  `is_busy_not_scrape`) is embedded under `trackers` for the app's announce
+  indicator. Add new aliases in `GLOBAL_ALIASES` / `TORRENT_ALIASES` if
+  rtorrent renames more commands.
 - **`model.py`** — POPO containers (`Global`, `Torrent`, `Tracker`, `Peer`,
   `File`, `Client`). `add_attribute` reflects XML-RPC keys (`d.bytes_done=` →
   `bytes_done`) onto the object via `__setattr__`. Diff/serialization uses
@@ -232,7 +241,7 @@ version if it starts with `v` — which is why release tags are `v*`.
 | `push.sh`               | One-liner `git commit -am ... && git push` helper.         |
 | `cert/`                 | TLS material + a Java keystore for the Android client. **Test/demo material — the private keys are public.** |
 | `test/`                 | pytest suite incl. a fake rtorrent (see below).            |
-| `test/deps/`            | Static rtorrent 0.9.6/0.9.7/0.9.8 binaries (7z), fixture torrents, rtorrent.rc, terminfo for CI. |
+| `test/deps/`            | Fixture torrents and a sample rtorrent.rc (0.16 syntax). |
 
 ## Configuration (environment variables)
 
@@ -283,26 +292,27 @@ The `test/` package is pytest-driven:
   `get_peers`, `get_trackers`, the `disk_usage` plugin, and live update
   propagation for global settings and per-torrent attributes.
 - **`fake_rtorrent.py`** — an in-process fake rtorrent SCGI/XML-RPC server
-  (global getters/setters, all four multicalls, `fake.add_torrent` /
-  `fake.remove_torrent` control methods). It can emit both response styles:
-  pretty-printed XML like rtorrent 0.9.x (xmlrpc-c) and compact XML like
-  rtorrent ≥ 0.10 (tinyxml2).
+  mimicking rtorrent 0.16 (current command names, api_version 26, compact
+  tinyxml2 XML, per-command fault structs for unknown commands in
+  `system.multicall`; global getters/setters, all four multicalls,
+  `fake.add_torrent` / `fake.remove_torrent` control methods).
 - **`wss_smoke_test.py`** — full end-to-end protocol suite against the fake,
   **no rtorrent or Linux required**; runs the real daemonized server in a
   temp dir and covers registration per view, details, diff pushes, per-view
-  `new` filtering, all error paths, view re-registration, and updater
-  resilience across an rtorrent outage. Runs twice (pretty + compact XML).
+  `new` filtering, wire-name aliasing, all error paths, view re-registration,
+  and updater resilience across an rtorrent outage.
 - **`plugins_test.py`** — direct unit tests for plugins.
 
 Local quick run (any OS): `PYTHONPATH=. pytest test/plugins_test.py test/wss_smoke_test.py`
 
-GitHub Actions runs two workflows on ubuntu-latest / Python 3.12:
-`basic_rpc.yml` (API-version sanity against rtorrent 0.9.6/0.9.7/0.9.8 — the
-bundled binaries are fully static, so they run on modern runners) and
-`main_suite.yml` (full suite against all three rtorrent versions, plus the
-tag-triggered `deploy` job that minifies the sources, substitutes
-`__RTR_VERSION_PLACEHOLDER__`, builds a `.pyz` zipapp and uploads a GitHub
-release).
+GitHub Actions runs two workflows on ubuntu-latest / Python 3.12, both of
+which **build rtorrent v0.16.22 + libtorrent from the rakshasa sources**
+(cached via `actions/cache`, so only the first run after a version bump
+compiles): `basic_rpc.yml` (API-version sanity) and `main_suite.yml` (full
+suite, plus the tag-triggered `deploy` job that minifies the sources,
+substitutes `__RTR_VERSION_PLACEHOLDER__`, builds a `.pyz` zipapp and uploads
+a GitHub release). Bump the `RTORRENT_VERSION` env in both workflows to test
+against a newer rtorrent.
 
 ## Companion Android app (`../RTorrentRemote/`)
 
@@ -328,7 +338,9 @@ When modifying the protocol — adding fields, views, or methods — both sides
 move together:
 
 - New rtorrent fields → add to the command list in `remote.py`, then surface
-  the corresponding attribute in the Android model.
+  the corresponding attribute in the Android model. If rtorrent ever renames
+  a command, keep the old wire field name via the alias maps in `remote.py` —
+  the app looks fields up by exact key (see `GlobalViewModel.java`).
 - New views → add to `Cached.VIEWS` here, then add the matching fragment +
   navigation entry on the Android side (`Constants.RtorrentView`).
 - New plugins → drop a class in `plugins/`, register it in `Cached.plugins`,
