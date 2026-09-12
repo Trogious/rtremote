@@ -2,6 +2,9 @@ name: main test suite
 
 on: [push]
 
+env:
+  RTORRENT_VERSION: v0.16.22
+
 jobs:
   test:
     runs-on: ubuntu-latest
@@ -16,66 +19,45 @@ jobs:
         python -m pip install --upgrade pip
         pip install -r requirements.txt
         pip install pytest
-        command -v 7z >/dev/null || { sudo apt-get update && sudo apt-get install -y p7zip-full; }
-    - name: 0.9.8
+    - name: cache rtorrent
+      id: cache-rtorrent
+      uses: actions/cache@v4
+      with:
+        path: ~/rtorrent-prefix
+        key: rtorrent-${{env.RTORRENT_VERSION}}-${{runner.os}}-1
+    - name: build rtorrent
+      if: steps.cache-rtorrent.outputs.cache-hit != 'true'
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y autoconf automake libtool pkg-config libssl-dev zlib1g-dev libcurl4-openssl-dev libncurses-dev
+        git clone --depth 1 --branch $RTORRENT_VERSION https://github.com/rakshasa/libtorrent.git $HOME/libtorrent-src
+        cd $HOME/libtorrent-src
+        autoreconf -ivf
+        ./configure --prefix=$HOME/rtorrent-prefix
+        make -j$(nproc)
+        make install
+        git clone --depth 1 --branch $RTORRENT_VERSION https://github.com/rakshasa/rtorrent.git $HOME/rtorrent-src
+        cd $HOME/rtorrent-src
+        autoreconf -ivf
+        PKG_CONFIG_PATH=$HOME/rtorrent-prefix/lib/pkgconfig ./configure --prefix=$HOME/rtorrent-prefix --with-xmlrpc-tinyxml2
+        make -j$(nproc)
+        make install
+    - name: run tests
       env:
         PYTHONPATH: .
         RTR_SCGI_SOCKET_PATH: ./.rtorrent.sock
-        RTR_SYSTEM_CLIENT_VERSION: 0.9.8
-        RTR_SYSTEM_API_VERSION: 10
+        RTR_SYSTEM_CLIENT_VERSION: 0.16.22
+        RTR_SYSTEM_API_VERSION: 26
       run: |
-        7z e -y ./test/deps/rtorrent-0.9.8.7z
-        chmod +x ./rtorrent-0.9.8
-        ./rtorrent-0.9.8 -n -o system.daemon.set=true -o network.xmlrpc.size_limit.set=2097152 -o throttle.global_down.max_rate.set=1024 -o throttle.global_up.max_rate.set=1024 -o throttle.max_peers.normal.set=100 -o throttle.max_peers.seed.set=-1 -o throttle.max_uploads.global.set=100 -o throttle.min_peers.normal.set=1 -o throttle.min_peers.seed.set=2 -o encoding.add=UTF-8 -o network.port_random.set=no -o network.port_range.set=22400-22400 -o network.scgi.open_local=./.rtorrent.sock -o network.max_open_files.set=8000 -o file.prioritize_toc.set=1 -o load.normal='test/deps/torrents/*.torrent' &
+        mkdir -p dl
+        $HOME/rtorrent-prefix/bin/rtorrent -n -o system.daemon.set=true -o directory.default.set=$PWD/dl -o network.xmlrpc.size_limit.set=2097152 -o throttle.global_down.max_rate.set=1024 -o throttle.global_up.max_rate.set=1024 -o network.listen.port.range.set=22400-22400 -o network.scgi.open_local=./.rtorrent.sock -o "load.normal=test/deps/torrents/*.torrent" &
         ./start.sh &
         pytest ./test
         wss_pid=`cat ./wss_server.pid`
         kill $wss_pid
         sleep 1
         test -f ./wss_server.pid && kill -9 $wss_pid
-        kill -9 `pidof rtorrent-0.9.8`
-    - name: 0.9.7
-      env:
-        PYTHONPATH: .
-        RTR_SCGI_SOCKET_PATH: ./.rtorrent.sock
-        RTR_SYSTEM_CLIENT_VERSION: 0.9.7
-        RTR_SYSTEM_API_VERSION: 9
-      run: |
-        7z e -y ./test/deps/rtorrent-0.9.7.7z
-        chmod +x ./rtorrent-0.9.7
-        ./rtorrent-0.9.7 -n -o system.daemon.set=true -o network.xmlrpc.size_limit.set=2097152 -o throttle.global_down.max_rate.set=1024 -o throttle.global_up.max_rate.set=1024 -o throttle.max_peers.normal.set=100 -o throttle.max_peers.seed.set=-1 -o throttle.max_uploads.global.set=100 -o throttle.min_peers.normal.set=1 -o throttle.min_peers.seed.set=2 -o encoding.add=UTF-8 -o network.port_random.set=no -o network.port_range.set=22400-22400 -o network.scgi.open_local=./.rtorrent.sock -o network.max_open_files.set=8000 -o file.prioritize_toc.set=1 -o load.normal='test/deps/torrents/*.torrent' &
-        ./start.sh &
-        pytest ./test
-        wss_pid=`cat ./wss_server.pid`
-        kill $wss_pid
-        sleep 1
-        test -f ./wss_server.pid && kill -9 $wss_pid
-        kill -9 `pidof rtorrent-0.9.7`
-    - name: setup env 0.9.6
-      run: |
-        command -v screen >/dev/null || { sudo apt-get update && sudo apt-get install -y screen; }
-        mkdir -p ~/.terminfo/s
-        cp ./test/deps/xterm ~/.terminfo/s/screen
-        sudo mkdir -p /run/screen
-        sudo chmod 777 /run/screen
-    - name: 0.9.6
-      env:
-        TERM: screen
-        PYTHONPATH: .
-        RTR_SCGI_SOCKET_PATH: ./.rtorrent.sock
-        RTR_SYSTEM_CLIENT_VERSION: 0.9.6
-        RTR_SYSTEM_API_VERSION: 9
-      run: |
-        7z e -y ./test/deps/rtorrent-0.9.6.7z
-        chmod +x ./rtorrent-0.9.6
-        screen -dm ./rtorrent-0.9.6 -n -o network.xmlrpc.size_limit.set=2097152 -o throttle.global_down.max_rate.set=1024 -o throttle.global_up.max_rate.set=1024 -o throttle.max_peers.normal.set=100 -o throttle.max_peers.seed.set=-1 -o throttle.max_uploads.global.set=100 -o throttle.min_peers.normal.set=1 -o throttle.min_peers.seed.set=2 -o encoding.add=UTF-8 -o network.port_random.set=no -o network.port_range.set=22400-22400 -o network.scgi.open_local=./.rtorrent.sock -o network.max_open_files.set=8000 -o file.prioritize_toc.set=1 -o load.normal='test/deps/torrents/*.torrent'
-        ./start.sh &
-        pytest ./test
-        wss_pid=`cat ./wss_server.pid`
-        kill $wss_pid
-        sleep 1
-        test -f ./wss_server.pid && kill -9 $wss_pid
-        kill -9 `pidof rtorrent-0.9.6`
+        kill -9 `pidof rtorrent`
   deploy:
     needs: test
     if: startsWith(github.ref, 'refs/tags/v')
