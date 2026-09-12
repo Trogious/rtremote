@@ -1,8 +1,15 @@
 def extract_value(value):
-    return value.popitem()[1]
+    # a value is a single-key dict like {'string': 'x'} or {'i8': 1}; an empty
+    # element (e.g. <string/>) comes through as None
+    if isinstance(value, dict) and value:
+        return next(iter(value.values()))
+    return value
 
 
 def add_attribute(obj, params, record):
+    r = record['array']['data']['value']
+    if not isinstance(r, list):  # single value is not wrapped in a list
+        r = [r]
     for i in range(len(params)):
         attr = params[i]
         if len(attr) > 1 and attr[1] == '.':
@@ -10,9 +17,6 @@ def add_attribute(obj, params, record):
         if attr[-1] == '=':
             attr = attr[:-1]
         attr = attr.replace('.', '_')
-        r = record['array']['data']['value']
-        if len(r) < 2:
-            r = [r]
         obj.__setattr__(attr, extract_value(r[i]))
 
 
@@ -22,10 +26,9 @@ class Global:
 
     def add_attributes(self, data, params):
         data = data['methodResponse']['params']['param']['value']['array']['data']['value']
-        data_len = len(data)
-        if data_len < 2:
+        if not isinstance(data, list):  # single result is not wrapped in a list
             data = [data]
-        for i in range(data_len):
+        for i in range(len(data)):
             add_attribute(self, [params[i]], data[i])
 
 
@@ -100,7 +103,8 @@ class Client:
             self.port = -1
 
     def __repr__(self):
-        return '%s:%d,%d,%s' % (self.ip, self.port, self.req_id, self.view_name)
+        # req_id is whatever JSON value the client sent as its request id
+        return '%s:%d,%s,%s' % (self.ip, self.port, self.req_id, self.view_name)
 
     def __hash__(self):
         return self.websocket.__hash__()
