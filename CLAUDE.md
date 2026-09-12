@@ -306,13 +306,13 @@ The `test/` package is pytest-driven:
 Local quick run (any OS): `PYTHONPATH=. pytest test/plugins_test.py test/wss_smoke_test.py`
 
 GitHub Actions runs two workflows on ubuntu-latest / Python 3.12, both of
-which **build rtorrent v0.16.22 + libtorrent from the rakshasa sources**
-(cached via `actions/cache`, so only the first run after a version bump
-compiles): `basic_rpc.yml` (API-version sanity) and `main_suite.yml` (full
-suite, plus the tag-triggered `deploy` job that minifies the sources,
-substitutes `__RTR_VERSION_PLACEHOLDER__`, builds a `.pyz` zipapp and uploads
-a GitHub release). Bump the `RTORRENT_VERSION` env in both workflows to test
-against a newer rtorrent.
+which download a **prebuilt static rtorrent 0.16.22** from
+[Trogious/rtorrent-static](https://github.com/Trogious/rtorrent-static)
+(URL in the workflows' `RTORRENT_STATIC_URL` env - update it there to test
+against a newer rtorrent): `basic_rpc.yml` (API-version sanity) and
+`main_suite.yml` (full suite, plus the tag-triggered `deploy` job that
+minifies the sources, substitutes `__RTR_VERSION_PLACEHOLDER__`, builds a
+`.pyz` zipapp and uploads a GitHub release).
 
 ## Companion Android app (`../RTorrentRemote/`)
 

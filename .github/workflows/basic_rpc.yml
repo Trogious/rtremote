@@ -3,7 +3,7 @@ name: minimum tests (API version)
 on: [push]
 
 env:
-  RTORRENT_VERSION: v0.16.22
+  RTORRENT_STATIC_URL: https://github.com/Trogious/rtorrent-static/releases/download/v0.16.22.-static/rtorrent-static-v0.16.22.txz
 
 jobs:
   test:
@@ -19,29 +19,11 @@ jobs:
         python -m pip install --upgrade pip
         pip install -r requirements.txt
         pip install pytest
-    - name: cache rtorrent
-      id: cache-rtorrent
-      uses: actions/cache@v4
-      with:
-        path: ~/rtorrent-prefix
-        key: rtorrent-${{env.RTORRENT_VERSION}}-${{runner.os}}-1
-    - name: build rtorrent
-      if: steps.cache-rtorrent.outputs.cache-hit != 'true'
+    - name: get rtorrent
       run: |
-        sudo apt-get update
-        sudo apt-get install -y autoconf automake libtool pkg-config libssl-dev zlib1g-dev libcurl4-openssl-dev libncurses-dev
-        git clone --depth 1 --branch $RTORRENT_VERSION https://github.com/rakshasa/libtorrent.git $HOME/libtorrent-src
-        cd $HOME/libtorrent-src
-        autoreconf -ivf
-        ./configure --prefix=$HOME/rtorrent-prefix
-        make -j$(nproc)
-        make install
-        git clone --depth 1 --branch $RTORRENT_VERSION https://github.com/rakshasa/rtorrent.git $HOME/rtorrent-src
-        cd $HOME/rtorrent-src
-        autoreconf -ivf
-        PKG_CONFIG_PATH=$HOME/rtorrent-prefix/lib/pkgconfig ./configure --prefix=$HOME/rtorrent-prefix --with-xmlrpc-tinyxml2
-        make -j$(nproc)
-        make install
+        curl -sSfL -o /tmp/rtorrent.txz "$RTORRENT_STATIC_URL"
+        tar -xJf /tmp/rtorrent.txz -C /tmp
+        chmod +x /tmp/rtorrent-static
     - name: run tests
       env:
         PYTHONPATH: .
@@ -50,6 +32,6 @@ jobs:
         RTR_SYSTEM_API_VERSION: 26
       run: |
         mkdir -p dl
-        $HOME/rtorrent-prefix/bin/rtorrent -n -o system.daemon.set=true -o directory.default.set=$PWD/dl -o network.scgi.open_local=./.rtorrent.sock &
+        /tmp/rtorrent-static -n -o system.daemon.set=true -o directory.default.set=$PWD/dl -o network.scgi.open_local=./.rtorrent.sock &
         pytest ./test/api_version_test.py
-        kill -9 `pidof rtorrent`
+        kill -9 `pidof rtorrent-static`
