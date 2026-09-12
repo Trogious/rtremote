@@ -21,6 +21,9 @@ connect to. It polls rtorrent on a fixed interval, computes deltas, and pushes
 only the changes out to every connected client — so the app gets near-realtime
 updates without the cost of re-sending the full state every tick.
 
+Requires **Python 3.9+**; pinned dependencies are `websockets` (15.x, the
+current `asyncio` API), `cachetools` and `xmljson`.
+
 ## How it works
 
 ### Lifecycle
@@ -28,33 +31,62 @@ updates without the cost of re-sending the full state every tick.
 1. `start.sh` sets environment variables (cert path, socket path, secret key
    SHA1, listen host/port, polling interval, plugin config) and execs
    `server_wss.py`.
-2. `server_wss.py` daemonizes, writes a PID file, loads the TLS cert, and
-   spawns three async tasks on the event loop:
-   - **`websockets.serve(...)`** — the TLS WebSocket server (handler
-     `on_message`).
-   - **`global_data_updater()`** — every `RTR_RETR_INTERVAL` seconds, fetches
-     global stats + torrent list from rtorrent, computes diffs against the
-     previous snapshot, and broadcasts any changes to all registered clients.
-   - **`short_caches_cleaner()`** — periodically wipes the short-lived TTL
-     caches used for files / peers / trackers / view-hash lookups.
+2. `server_wss.py` daemonizes (double fork, stdio redirected to `/dev/null`;
+   pass `-f`/`--foreground` to skip this — handy for debugging and
+   containers), writes a PID file, then runs `asyncio.run(amain())`, which:
+   - creates the asyncio locks (`Cached.init_async()`) — they must be created
+     **inside** the running loop because the module is imported before the
+     daemon fork, and a pre-fork event loop does not survive `fork()` on
+     kqueue platforms (macOS/BSD);
+   - starts **`global_data_updater()`** — every `RTR_RETR_INTERVAL` seconds,
+     fetches global stats + torrent list from rtorrent, computes diffs against
+     the previous snapshot, and broadcasts changes to registered clients. A
+     failed poll (rtorrent restarting, socket gone) is logged and retried on
+     the next tick; it never kills the server;
+   - starts **`short_caches_cleaner()`** — periodically wipes the short-lived
+     TTL caches used for files / peers / trackers / view-hash lookups;
+   - waits for the **first successful rtorrent snapshot**, then opens the TLS
+     WebSocket listener (handler `on_message`). Clients can never register
+     against an empty state; if rtorrent is down at startup the server waits
+     (retrying) before it starts listening.
 3. SIGINT / SIGTERM / SIGUSR1 stop the loop cleanly; the PID file is removed.
+
+All rtorrent RPC calls are synchronous socket I/O and are executed via
+`asyncio.to_thread(...)` so they never block the event loop; each SCGI socket
+carries an `RTR_SCGI_TIMEOUT` (default 30 s) timeout as a hang guard.
 
 ### Client protocol (JSON-RPC 2.0 over WSS)
 
 The Android app speaks JSON-RPC 2.0 over a single persistent secure WebSocket.
 
-- **`register`** — authentication + initial snapshot. The client sends a SHA1
-  secret_key (compared against `RTR_SECRET_KEY_SHA1`) and an optional view
-  name. On success, the server replies with the current `version`, `global`
-  data, full `torrents` list, and any `plugins` output, filtered by view.
-  Subsequent diffs are pushed automatically on the same socket; the client
-  does not poll.
-- **`get_files` / `get_peers` / `get_trackers`** — request a per-torrent detail
-  list, identified by `{"hash": "<info_hash>"}`. These results are served from
-  a short TTL cache (`RTR_SHORT_CACHE_TTL`, default 5s) so multiple clients
-  hitting the same torrent don't hammer rtorrent.
+- **`register`** — authentication + initial snapshot. The client sends the
+  plaintext `secret_key` (inside TLS) and an optional `view` name. The server
+  SHA1-hashes the key and compares it (constant-time) against
+  `RTR_SECRET_KEY_SHA1`. On success, the server replies with the current
+  `version`, `global` data, full `torrents` list, and any `plugins` output,
+  filtered/ordered by view. Subsequent diffs are pushed automatically on the
+  same socket **re-using the `id` of the client's latest `register` request**;
+  the client does not poll.
+  - Re-sending `register` on the same socket switches the client's view (the
+    app does this on fragment changes) and returns a fresh snapshot under the
+    new request id; later pushes use the new id.
+  - A push may occasionally be delivered *before* the register response on
+    re-register (both directions are async); the app's merge logic tolerates
+    this.
+- **`get_files` / `get_peers` / `get_trackers`** — request a per-torrent
+  detail list, identified by `{"hash": "<info_hash>"}`. The hash must be a
+  40-char hex string (it is embedded into an XML-RPC call; anything else is
+  rejected with a JSON-RPC error). Results are served from a short TTL cache
+  (`RTR_SHORT_CACHE_TTL`, default 5 s) so multiple clients hitting the same
+  torrent don't hammer rtorrent.
 
-Unregistered or invalid requests cause the socket to be dropped.
+Error handling, by client state:
+- **Unauthenticated** sockets get no feedback: invalid JSON, malformed
+  JSON-RPC, wrong secret, or any method before `register` ⇒ the socket is
+  dropped (close code 1000). This is deliberate — no auth oracle.
+- **Registered** clients get proper JSON-RPC `error` objects (`-32601` unknown
+  method, `-32602` invalid hash, `-32603` rtorrent fault/internal) and the
+  connection stays usable. The app routes these to `onError` and logs them.
 
 ### Views
 
@@ -63,11 +95,20 @@ ones the server knows about:
 
 `main` (default — all torrents), `name` (all torrents sorted by name),
 `started`, `stopped`, `complete`, `incomplete`, `hashing`, `seeding`,
-`leeching`, `active`.
+`leeching`, `active`. An unknown view name falls back to `main`.
 
-For non-default views the server asks rtorrent for the view's hash list (also
-cached) and filters/reorders the diff payload before sending it to that
-client. Each connected client sticks with the view it registered with.
+Per-view behavior (verified against the Android app's merge logic in
+`DataManager.java` / `TorrentsParser.java`):
+- **Register snapshot**: for non-default views the server fetches the view's
+  hash list from rtorrent (cached), filters the torrent list to view members
+  (except `name`, which has all torrents) and applies the view's ordering.
+- **Broadcast diffs**: only the `new` section is filtered per view — the app
+  blindly `putAll`s every `new` torrent into whatever view it is showing, so
+  unfiltered broadcasts would corrupt filtered views. `changed` and `del` are
+  deliberately **not** filtered: the app ignores `changed`/`del` entries for
+  hashes it doesn't display, and filtering `changed` would leave stale rows
+  when a torrent migrates between views mid-session. A client whose filtered
+  payload ends up empty receives nothing that tick.
 
 ### Diff engine (`diffs.py`)
 
@@ -78,19 +119,33 @@ client. Each connected client sticks with the view it registered with.
   torrents), `del` (list of hashes that disappeared), and `changed` (per-hash
   dicts of just the fields that moved).
 
-The updater only broadcasts if at least one of these sections is non-empty,
-so an idle client receives nothing.
+The updater only broadcasts if at least one section (or a plugin) reports a
+change, so an idle client receives nothing.
 
 ### rtorrent RPC layer
 
-- **`scgi.py`** — minimal SCGI client. Supports both UNIX domain sockets
-  (`./.rtorrent.sock` or `unix:`/`local:` prefixes) and TCP (`inet:host:port`).
-  Uses `pynetstring` for the SCGI header framing.
+- **`scgi.py`** — minimal SCGI client. Supports UNIX domain sockets
+  (`./.rtorrent.sock`, optionally `unix:`/`local:` prefixed) and TCP
+  (`inet:host:port`; IPv4/hostname only, no bracketed IPv6). `CONTENT_LENGTH`
+  is sent first (rtorrent requires that), counted in **bytes**, and sockets
+  are timeout-guarded and always closed. Netstring framing is inlined (no
+  dependency).
 - **`rpc.py`** (`RTorrentRpc`) — builds raw XML-RPC method calls, posts them
   over SCGI, parses responses with `xmljson.parker`, and wraps the typed
   multicalls: `d.multicall2` (downloads), `t.multicall` (trackers),
   `p.multicall` (peers), `f.multicall` (files), `system.multicall` (batched
-  global getters).
+  global getters). Important details:
+  - All string parameters are XML-escaped (`xml.sax.saxutils.escape`) — raw
+    interpolation would let a crafted "hash" inject extra XML-RPC parameters.
+  - Multicall arguments always go out as `<string>` (`string_params`); the
+    type-guessing `extract_params` is only for ad-hoc `call()` users (tests) —
+    guessing would corrupt an all-digit info hash into an integer.
+  - XML-RPC **faults raise `RpcError`**, which the WSS layer converts into a
+    JSON-RPC error for the client.
+  - Empty multicall results parse to `None` (compact XML from modern
+    rtorrent's tinyxml2 backend, e.g. `<data/>`) or a whitespace string
+    (pretty-printed xmlrpc-c output from rtorrent 0.9.x); both are handled.
+    Relying on only one of the two styles is a known historical trap.
 - **`remote.py`** (`Remote`) — domain layer on top of the RPC. Knows which
   rtorrent commands to fetch and adapts the set per detected
   `system.api_version`:
@@ -105,37 +160,60 @@ so an idle client receives nothing.
 - **`model.py`** — POPO containers (`Global`, `Torrent`, `Tracker`, `Peer`,
   `File`, `Client`). `add_attribute` reflects XML-RPC keys (`d.bytes_done=` →
   `bytes_done`) onto the object via `__setattr__`. Diff/serialization uses
-  `__dict__` directly.
+  `__dict__` directly. Parser quirks to be aware of: `xmljson.parker` coerces
+  numeric-looking strings to ints (a torrent named `12345` arrives as an int)
+  and empty XML elements to `None` (an empty `d.message` becomes JSON `null`;
+  the app's `optString` copes with both).
 
 ### Plugins (`plugins/`)
 
 Lightweight extensibility. A plugin is any class exposing:
 
 - `name()` → string label used as a JSON key
-- `async get(changed_only=True)` → dict (or `None` to suppress when
-  `changed_only=True` and nothing changed)
+- `async get(changed_only=True)` → dict or `None`
 
-The shipped `DiskUsage` plugin reports total/used/free across the
-colon-separated paths in `RTR_PLUGINS_DISK_USAGE_PATHS`. The plugin list is
-hardcoded in `Cached.plugins` in `server_wss.py`. Plugin output rides along
-inside the regular WSS payload under `result.plugins.<plugin_name>`, both at
-register time and in subsequent change broadcasts.
+The `changed_only` contract matters:
+- the **updater** calls `get()` (i.e. `changed_only=True`): return the current
+  data **only if it changed** since the last changed-only call, else `None`
+  (so idle ticks stay silent), and remember what was reported;
+- the **register handler** calls `get(False)`: always return current data, but
+  **never update the change tracking** — otherwise a client registering
+  between two ticks would swallow a change broadcast meant for everyone else.
+
+The shipped `DiskUsage` plugin reports total/used/free summed across the
+colon-separated paths in `RTR_PLUGINS_DISK_USAGE_PATHS` (nonexistent paths
+contribute zero). The plugin list is hardcoded in `Cached.plugins` in
+`server_wss.py`. Plugin output rides along inside the regular WSS payload
+under `result.plugins.<plugin_name>`, both at register time and in change
+broadcasts.
 
 ### Caching layers
 
 - **Long-lived state**: `Cached.global_data` and `Cached.torrents` hold the
-  last snapshots used to compute diffs. Guarded by `asyncio.Lock`.
+  last snapshots used to compute diffs. Guarded by `asyncio.Lock` (created in
+  `Cached.init_async()`).
 - **Short TTL caches**: four `TTLCache(maxsize=4096, ttl=RTR_SHORT_CACHE_TTL)`
   instances, one each for files / peers / trackers / view-hash lookups,
-  guarded by `RLock` (sync, because `cachetools.cached` is sync). The
-  `short_caches_cleaner` task wipes them periodically.
+  guarded by `RLock` (sync, because `cachetools.cached` is sync and the
+  lookups run in worker threads). The `short_caches_cleaner` task wipes them
+  periodically.
+
+### Broadcast mechanics
+
+`Cached.notify_clients` snapshots the client set, builds one payload per view
+(cached per tick), and sends to all clients **concurrently**
+(`asyncio.gather`). A single send is capped at `RTR_SEND_TIMEOUT` (10 s); on
+timeout the client's transport is aborted so one stuck client cannot stall
+the updater or other clients. Failed sends are logged; the client registry is
+cleaned up when the handler's `finally` runs.
 
 ### Versioning
 
 `RTR_VERSION` in `server_wss.py` is the literal string
 `__RTR_VERSION_PLACEHOLDER__` in source. It is substituted at release/build
-time and surfaced to the Android client inside the `register` response so the
-app can warn on incompatible servers.
+time (see the `deploy` job in `main_suite.yml`) and surfaced to the Android
+client inside the `register` response. The app only treats it as a real
+version if it starts with `v` — which is why release tags are `v*`.
 
 ## Files at a glance
 
@@ -143,25 +221,22 @@ app can warn on incompatible servers.
 | ----------------------- | ---------------------------------------------------------- |
 | `server_wss.py`         | Main entry. WSS server, updater loop, client registry.     |
 | `remote.py`             | rtorrent command sets per API version; tracker aggregation.|
-| `rpc.py`                | XML-RPC builder / response parser over SCGI.               |
-| `scgi.py`               | SCGI transport (UNIX + TCP).                               |
+| `rpc.py`                | XML-RPC builder / response parser over SCGI; `RpcError`.   |
+| `scgi.py`               | SCGI transport (UNIX + TCP), timeouts, netstring framing.  |
 | `model.py`              | Data classes for Global/Torrent/Tracker/Peer/File/Client.  |
 | `diffs.py`              | Map and torrent-list diff helpers.                         |
 | `utils.py`              | Logger (rotating file), SHA1 helper, env-path resolver.    |
 | `plugins/`              | Plugin package; ships `DiskUsage`.                         |
 | `client_wss.py`         | Minimal local WSS client useful for ad-hoc smoke testing.  |
 | `start.sh`              | Env-var wrapper that launches the server.                  |
-| `upRtorrent.sh`         | Spins up a local `rtorrent` configured for the test suite. |
-| `cert/`                 | TLS material + a Java keystore for the Android client.     |
-| `alt/`                  | `.torrent` files used as fixtures.                         |
-| `test/`                 | pytest suite (see below).                                  |
-| `rtorrent-0.9.{6,7,8}`  | Bundled rtorrent binaries used in CI / local testing.      |
-| `x.py`, `x.xml`, `y.xml`| One-off helpers that template Android view fragments/menus from a `_X_` / `_Y_` source — used to keep the Android `RTorrentRemote` app's per-view fragment XML in sync with the view list this server supports. |
+| `push.sh`               | One-liner `git commit -am ... && git push` helper.         |
+| `cert/`                 | TLS material + a Java keystore for the Android client. **Test/demo material — the private keys are public.** |
+| `test/`                 | pytest suite incl. a fake rtorrent (see below).            |
+| `test/deps/`            | Static rtorrent 0.9.6/0.9.7/0.9.8 binaries (7z), fixture torrents, rtorrent.rc, terminfo for CI. |
 
 ## Configuration (environment variables)
 
-All read by `server_wss.py` at startup; `start.sh` is the canonical place to
-set them.
+All read at startup; `start.sh` is the canonical place to set them.
 
 | Variable                          | Default                                | Purpose                                            |
 | --------------------------------- | -------------------------------------- | -------------------------------------------------- |
@@ -169,46 +244,95 @@ set them.
 | `RTR_LISTEN_HOST`                 | `127.0.0.1`                            | WSS bind host.                                     |
 | `RTR_LISTEN_PORT`                 | `8765`                                 | WSS bind port.                                     |
 | `RTR_SCGI_SOCKET_PATH`            | `./.rtorrent.sock`                     | rtorrent SCGI socket (UNIX path or `inet:host:p`). |
-| `RTR_SECRET_KEY_SHA1`             | SHA1 of `abc123`                       | Pre-shared auth secret (SHA1 hex).                 |
+| `RTR_SECRET_KEY_SHA1`             | SHA1 of `abc123`                       | Pre-shared auth secret (SHA1 hex). Server warns loudly when left at the default. |
 | `RTR_RETR_INTERVAL`               | `5`                                    | Seconds between rtorrent polls.                    |
 | `RTR_SHORT_CACHE_TTL`             | `5`                                    | TTL for files/peers/trackers/view caches.          |
+| `RTR_SCGI_TIMEOUT`                | `30`                                   | Per-operation SCGI socket timeout (seconds).       |
 | `RTR_PID_PATH`                    | `./wss_server.pid`                     | PID file written after daemonize.                  |
 | `RTR_LOG_PATH`                    | `./rtr_wss_server.log`                 | Rotating log file (4 × 200 KiB).                   |
 | `RTR_PLUGINS_DISK_USAGE_PATHS`    | `/`                                    | Colon-separated paths for the disk-usage plugin.   |
 
+CLI flags: `-f` / `--foreground` — do not daemonize.
+
+## Security model
+
+- Transport is TLS-only; the Android side pins the CA via
+  `cert/rtr_keystore.jks` (or optionally trusts everything if the user enables
+  "accept self-signed" in the app). **Everything under `cert/` is committed,
+  public test material** (including private keys and the CA passphrase) —
+  fine for CI, never for a real deployment; users must generate their own
+  (`cert/howto.txt`).
+- Auth is a single pre-shared secret: the app sends it in plaintext inside
+  TLS; the server compares `sha1(secret)` against `RTR_SECRET_KEY_SHA1` using
+  `hmac.compare_digest`. SHA1 here is a **wire-protocol constant** — changing
+  the algorithm breaks every existing client/config pair, so improvements
+  must be coordinated with the app.
+- The server is read-only toward rtorrent by design: no client input reaches
+  rtorrent except a strictly validated 40-hex info hash (and even that is
+  XML-escaped).
+
 ## Testing
 
-The `test/` package is pytest-driven and exercises two layers:
+The `test/` package is pytest-driven:
 
 - **`api_version_test.py` / `api_main_test.py`** — direct tests against the
-  `Remote` / `RTorrentRpc` layer, asserting known field values for fixtures in
-  `alt/`.
-- **`wss_server_test.py`** — end-to-end. Spawns a real `rtorrent`
-  (`upRtorrent.sh`), connects over WSS, registers, and verifies the JSON
-  payloads for `register` (per view), `get_files`, `get_peers`,
-  `get_trackers`, the `disk_usage` plugin, and live update propagation for
-  both global settings and per-torrent attributes.
+  `Remote` / `RTorrentRpc` layer, asserting known field values for the fixture
+  torrents in `test/deps/torrents/`. Need a real rtorrent on the SCGI socket.
+- **`wss_server_test.py`** — end-to-end against a real rtorrent + the server
+  started via `start.sh` (as in CI): `register` per view, `get_files`,
+  `get_peers`, `get_trackers`, the `disk_usage` plugin, and live update
+  propagation for global settings and per-torrent attributes.
+- **`fake_rtorrent.py`** — an in-process fake rtorrent SCGI/XML-RPC server
+  (global getters/setters, all four multicalls, `fake.add_torrent` /
+  `fake.remove_torrent` control methods). It can emit both response styles:
+  pretty-printed XML like rtorrent 0.9.x (xmlrpc-c) and compact XML like
+  rtorrent ≥ 0.10 (tinyxml2).
+- **`wss_smoke_test.py`** — full end-to-end protocol suite against the fake,
+  **no rtorrent or Linux required**; runs the real daemonized server in a
+  temp dir and covers registration per view, details, diff pushes, per-view
+  `new` filtering, all error paths, view re-registration, and updater
+  resilience across an rtorrent outage. Runs twice (pretty + compact XML).
 - **`plugins_test.py`** — direct unit tests for plugins.
 
-GitHub Actions runs two workflows: `basic_rpc.yml` (minimum API version
-sanity) and `main_suite.yml` (full WSS suite).
+Local quick run (any OS): `PYTHONPATH=. pytest test/plugins_test.py test/wss_smoke_test.py`
+
+GitHub Actions runs two workflows on ubuntu-latest / Python 3.12:
+`basic_rpc.yml` (API-version sanity against rtorrent 0.9.6/0.9.7/0.9.8 — the
+bundled binaries are fully static, so they run on modern runners) and
+`main_suite.yml` (full suite against all three rtorrent versions, plus the
+tag-triggered `deploy` job that minifies the sources, substitutes
+`__RTR_VERSION_PLACEHOLDER__`, builds a `.pyz` zipapp and uploads a GitHub
+release).
 
 ## Companion Android app (`../RTorrentRemote/`)
 
 The Android client is a standard Gradle project
 (`net.swmud.trog.rtorrentremote`) that talks to this server exclusively over
-the WSS / JSON-RPC 2.0 protocol described above. Its source lives at
-`/t/workspace/RTorrentRemote/` and is **not** part of this repo. When
-modifying the protocol — adding fields, views, or methods — both sides need to
+the WSS / JSON-RPC 2.0 protocol described above; its source is **not** part of
+this repo. Facts about the app that constrain server changes (verified in its
+source):
+
+- `WssClient.java` keeps one socket and re-sends `register` (new id) when the
+  user switches views; responses are routed by id (`ResponseRouter`), and a
+  response must contain either `result` or `error`.
+- `DataManager.onData` merges pushes: `torrents` as an **array** replaces the
+  list; as an **object** it is treated as a diff with `changed` (merged only
+  for known hashes), `del` (removed if present), `new` (**always added** —
+  which is why the server must filter `new` per view). New torrents also
+  trigger a phone notification.
+- The `version` field is only honored when it starts with `v`.
+- TLS: the app requests a `TLSv1.2` context; the server must keep TLS 1.2
+  enabled (it currently allows 1.2+).
+
+When modifying the protocol — adding fields, views, or methods — both sides
 move together:
 
 - New rtorrent fields → add to the command list in `remote.py`, then surface
   the corresponding attribute in the Android model.
-- New views → add to `Cached.VIEWS` here, then add a navigation entry on the
-  Android side (the `x.py` + `x.xml` / `y.xml` templates exist to generate the
-  Android fragment + menu XML for each view name in lockstep).
+- New views → add to `Cached.VIEWS` here, then add the matching fragment +
+  navigation entry on the Android side (`Constants.RtorrentView`).
 - New plugins → drop a class in `plugins/`, register it in `Cached.plugins`,
   and add UI for `result.plugins.<name>` in the app.
 
-The `cert/rtr_keystore.jks` is the Android trust store companion to
-`cert/cert.pem` — a self-signed cert pinned on the client side.
+The `cert/rtr_keystore.jks` is the Android trust-store companion to
+`cert/cert.pem` — a self-signed CA pinned on the client side.
