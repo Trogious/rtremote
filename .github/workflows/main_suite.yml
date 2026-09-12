@@ -63,6 +63,7 @@ jobs:
         RTDIR_V=${{github.event.repository.name}}-$TAG_NAME
         RTDIR=$RTDIR_V/${{github.event.repository.name}}
         mkdir -p $RTDIR/plugins
+        cp requirements.txt $RTDIR_V/
         sed -i "s/__RTR_VERSION_PLACEHOLDER__/$TAG_NAME/" server_wss.py
         for f in diffs.py model.py remote.py rpc.py scgi.py server_wss.py utils.py; do pyminify $f > $RTDIR/$f; done
         for f in plugins/*.py; do pyminify $f > $RTDIR/$f; done
