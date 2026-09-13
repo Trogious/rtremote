@@ -163,6 +163,18 @@ class State:
             for k, v in urllib.parse.parse_qsl(urllib.parse.urlparse(payload).query):
                 if k == 'dn':
                     name = v
+        elif raw:
+            # extract the torrent name from the bencoded info dict (4:name<len>:<name>)
+            try:
+                import base64 as _b64
+                blob = _b64.b64decode(payload)
+                m = __import__('re').search(rb'4:name(\d+):', blob)
+                if m:
+                    start = m.end()
+                    length = int(m.group(1))
+                    name = blob[start:start + length].decode('utf-8', 'replace')
+            except Exception:
+                name = None
         if not name:
             name = 'added-%d.iso' % n
         directory, label = '/home/seed/downloads', ''
@@ -225,7 +237,7 @@ def _parse_value(v):
         text = child.text or ''
         if tag in ('i4', 'i8', 'int'):
             return int(text)
-        if tag == 'string':
+        if tag in ('string', 'base64'):
             return text
         if tag == 'array':
             data = child.find('data')

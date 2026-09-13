@@ -891,3 +891,24 @@ def test_move_data_disabled_without_root(srv):
         assert r['error']['code'] == -32603
         await ws.close()
     asyncio.run(run())
+
+
+def test_m2_add_torrent_raw(srv):
+    # a .torrent file arrives as base64 content_b64 (load.raw_start); the fake
+    # extracts the bencoded name so the added torrent is recognisable
+    import base64
+    blob = b'd4:infod4:name12:raw-demo.iso6:lengthi42eee'
+    content = base64.b64encode(blob).decode()
+    async def run():
+        ws, _ = await _connect(srv)
+        r = await _call(ws, 'add_torrent', {'content_b64': content, 'start': True}, 400)
+        assert r['result'] == {'added': True}
+        added = [t for t in srv.state.torrents.values() if t['d.name'] == 'raw-demo.iso']
+        assert len(added) == 1
+        for h, t in list(srv.state.torrents.items()):
+            if t['d.name'] == 'raw-demo.iso':
+                srv.state.torrents.pop(h, None)
+        # invalid base64 is rejected before any rtorrent call
+        assert (await _call(ws, 'add_torrent', {'content_b64': 'not!base64', 'start': True}, 401))['error']['code'] == -32602
+        await ws.close()
+    asyncio.run(run())
