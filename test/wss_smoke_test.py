@@ -417,6 +417,86 @@ def test_survives_rtorrent_outage(srv):
             srv.rpc().call('network.http.max_total_connections.set', [('string', ''), ('i8', 32)])
         await ws.close()
     asyncio.run(run())
+    # the outage is blamed on rtorrent, logged once at its start and once at recovery
+    # (not a traceback per failed poll), with a hint on what to check
+    log = _read_log(srv)
+    failed = [l for l in log.splitlines() if 'rtorrent poll failed:' in l]
+    assert len(failed) == 1, log
+    assert '|ERROR|rtorrent|' in failed[0] and ' -> ' in failed[0]
+    assert 'Traceback' not in log
+    assert sum('|INFO|rtorrent|' in l and 'rtorrent is back after' in l for l in log.splitlines()) == 1, log
+
+
+def test_log_names_the_component(srv):
+    # every diagnostic line carries a "where" column: rtorrent / app / rtremote
+    log = _read_log(srv)
+    assert any('|INFO|rtremote|' in l and 'starting rtremote' in l and 'protocol level' in l for l in log.splitlines())
+    assert any('|INFO|rtremote|' in l and 'config: listen=' in l for l in log.splitlines())
+    assert any('|INFO|rtorrent|' in l and 'connected: rtorrent' in l for l in log.splitlines())
+    assert any('|INFO|rtremote|' in l and 'listening on wss://' in l for l in log.splitlines())
+
+    async def run():
+        # wrong secret: silently dropped on the wire, blamed on the app in the log
+        ws = await websockets.connect(srv.uri, ssl=_ssl_ctx())
+        await ws.send(_req('register', {'secret_key': 'wrong'}, id=7))
+        assert await _collect(ws, 1.0) == []
+
+        ws, _ = await _connect(srv)
+        # unknown method: the app is newer than rtremote
+        await ws.send(_req('no_such_method', {}, id=8))
+        frame = json.loads(await asyncio.wait_for(ws.recv(), 5))
+        assert frame['error']['code'] == -32601 and frame['error']['message'].startswith('rtremote: ')
+        # invalid params: the app sent something rtremote does not accept
+        await ws.send(_req('set_global', {'key': 'no_such_key', 'value': 1}, id=9))
+        frame = json.loads(await asyncio.wait_for(ws.recv(), 5))
+        assert frame['error']['code'] == -32602
+        # rtorrent fault on a stale hash: error text says who is to blame
+        await ws.send(_req('torrent_action', {'hash': 'D' * 40, 'action': 'start'}, id=10))
+        frame = json.loads(await asyncio.wait_for(ws.recv(), 5))
+        assert frame['error']['code'] == -32603
+        assert frame['error']['message'].startswith('app: rtorrent has no torrent with that hash'), frame
+        await ws.close()
+
+        # a client that does not trust the certificate: asyncio would swallow this
+        ctx = ssl.create_default_context()  # system CAs: our self-signed cert is rejected
+        try:
+            await websockets.connect(srv.uri, ssl=ctx, server_hostname='localhost')
+        except Exception:
+            pass
+        else:
+            pytest.fail('the test certificate must not be trusted by default')
+        # plain text on the TLS port
+        raw = socket.create_connection(('127.0.0.1', srv.port), 2)
+        raw.sendall(b'GET / HTTP/1.0\r\n\r\n')
+        try:
+            raw.recv(64)
+        except OSError:
+            pass
+        raw.close()
+    asyncio.run(run())
+
+    deadline = time.time() + 5
+    while time.time() < deadline:
+        log = _read_log(srv)
+        lines = log.splitlines()
+        checks = [
+            any('|WARNING|app|' in l and 'secret key mismatch' in l and 'RTR_SECRET_KEY_SHA1' in l for l in lines),
+            any('|WARNING|app|' in l and "unknown method 'no_such_method'" in l and 'update rtremote' in l
+                for l in lines),
+            any('|WARNING|app|' in l and 'rejected set_global' in l for l in lines),
+            any('|WARNING|app|' in l and 'write torrent_action' in l and 'no torrent with that hash' in l
+                for l in lines),
+            any('|WARNING|app|' in l and 'closed the connection during the TLS handshake' in l
+                and 'accept self-signed' in l for l in lines),
+            # the harness's own TCP port probe at startup must not read as a failed app connection
+            any('|INFO|app|' in l and 'closed before sending any TLS data' in l for l in lines),
+            any('|WARNING|app|' in l and 'plain text to the TLS port' in l for l in lines),
+        ]
+        if all(checks):
+            break
+        time.sleep(0.2)
+    assert all(checks), 'missing diagnostics %s in log:\n%s' % (checks, log)
+    assert 'Traceback' not in log, log
 
 
 async def _await_response_and_push(ws, req_id, push_pred, timeout=PUSH_TIMEOUT):

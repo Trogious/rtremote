@@ -5,6 +5,7 @@ import re
 import shutil
 
 from rpc import RpcError, RTorrentRpc
+from utils import WHERE_APP, WHERE_RTREMOTE
 
 SAFE_PATH_RE = re.compile(r'^/[\w /.\-+@]{0,1024}$')
 SAFE_GROUP_RE = re.compile(r'^[A-Za-z0-9_.\-]{1,64}$')
@@ -323,6 +324,10 @@ class Remote:
     @staticmethod
     def _require_under(path, root):
         if not root:
-            raise RpcError('data operations are not enabled on this server')
+            raise RpcError('data operations are not enabled on this server',
+                           'set RTR_DATA_ROOT in start.sh to the directory rtremote may move or delete files under',
+                           WHERE_RTREMOTE)
         if not Remote._is_under(path, root):
-            raise RpcError('path is outside the configured data root')
+            raise RpcError('path is outside the configured data root',
+                           'the app asked to touch %s, which is not under RTR_DATA_ROOT=%s' % (path, root),
+                           WHERE_APP)

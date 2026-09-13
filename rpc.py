@@ -1,14 +1,53 @@
-from xml.etree.ElementTree import fromstring
+from xml.etree.ElementTree import ParseError, fromstring
 from xml.sax.saxutils import escape
 
 from xmljson import parker
 
 from model import File, Global, Peer, Torrent, Tracker
 from scgi import Scgi
+from utils import WHERE_APP, WHERE_RTORRENT, WHERE_RTREMOTE
 
 
 class RpcError(Exception):
-    """rtorrent returned a fault, or the response could not be parsed."""
+    """rtorrent returned a fault, or the response could not be parsed.
+
+    `where` names the component to blame and `hint` what to check; `code` is
+    the XML-RPC fault code (None for a parse failure)."""
+
+    def __init__(self, message, hint=None, where=WHERE_RTORRENT, code=None, command=None):
+        super().__init__(message)
+        self.hint = hint
+        self.where = where
+        self.code = code
+        self.command = command
+
+
+def classify_fault(code, string, command):
+    # rtorrent fault codes seen in practice; the text is the reliable part
+    text = str(string or '')
+    label = ' (%s)' % command if command else ''
+    if 'Could not find info-hash' in text:
+        return RpcError('rtorrent has no torrent with that hash%s' % label,
+                        'the app acted on a torrent rtorrent no longer has; its list refreshes on the next push',
+                        WHERE_APP, code, command)
+    if 'not allowed for untrusted connections' in text:
+        return RpcError('rtorrent refused %s as untrusted' % (command or 'the command'),
+                        'rtremote sent this command with UNTRUSTED_CONNECTION=1 but rtorrent does not mark it '
+                        'safe; this is an rtremote bug, please report it', WHERE_RTREMOTE, code, command)
+    if 'not defined' in text or 'Method' in text and 'unknown' in text.lower():
+        return RpcError('rtorrent does not know the command %s' % (command or ''),
+                        'this rtorrent is too old or built without the command; rtremote needs rtorrent >= 0.16',
+                        WHERE_RTORRENT, code, command)
+    return RpcError('rtorrent fault %s%s: %s' % (code, label, text),
+                    'rtorrent rejected the request; the fault text above is its own explanation',
+                    WHERE_RTORRENT, code, command)
+
+
+def bad_response_error(detail, host_port):
+    return RpcError('no XML-RPC response from %s (%s)' % (host_port, detail),
+                    'something answered on the SCGI socket but not with XML-RPC: check that '
+                    'RTR_SCGI_SOCKET_PATH is rtorrent\'s network.scgi.open_local socket and that rtorrent '
+                    'was built with XML-RPC support')
 
 
 class RTorrentRpc:
@@ -52,18 +91,21 @@ class RTorrentRpc:
             value = ''.join(str(value).split())
         return '<param><value><%s>%s</%s></value></param>' % (tag, value, tag)
 
-    def _post(self, body, extra_headers=None):
+    def _post(self, body, extra_headers=None, command=None):
         scgi = Scgi(self.host_port)
         resp = scgi.post(body, extra_headers)
         start = resp.find('<')
         if start < 0:
-            raise RpcError('no XML found in SCGI response')
-        data = parker.data(fromstring(resp[start:]), preserve_root=True)  # convert to json
-        RTorrentRpc._check_fault(data)
+            raise bad_response_error('no XML in %d bytes' % len(resp), self.host_port)
+        try:
+            data = parker.data(fromstring(resp[start:]), preserve_root=True)  # convert to json
+        except ParseError as e:
+            raise bad_response_error('unparseable XML: %s' % e, self.host_port) from e
+        RTorrentRpc._check_fault(data, command)
         return data
 
     @staticmethod
-    def _check_fault(data):
+    def _check_fault(data, command=None):
         method_response = data.get('methodResponse') if isinstance(data, dict) else None
         if isinstance(method_response, dict) and 'fault' in method_response:
             code, string = None, None
@@ -76,7 +118,7 @@ class RTorrentRpc:
                         string = next(iter(m['value'].values()))
             except Exception:
                 pass
-            raise RpcError('rtorrent fault %s: %s' % (code, string))
+            raise classify_fault(code, string, command)
 
     def call(self, method, params=None, extra_headers=None):
         body = "<?xml version='1.0'?><methodCall><methodName>" + \
@@ -85,7 +127,7 @@ class RTorrentRpc:
             for p in params:
                 body += RTorrentRpc._param_xml(p)
         body += "</params></methodCall>"
-        return self._post(body, extra_headers)
+        return self._post(body, extra_headers, method)
 
     def set_value(self, command, value, untrusted=False):
         # untrusted=True sends rtorrent's UNTRUSTED_CONNECTION=1 SCGI header, so
@@ -116,7 +158,7 @@ class RTorrentRpc:
             for c in commands:
                 body += '<value>' + self.get_struct(c) + '</value>'
         body += "</data></array></value></param></params></methodCall>"
-        return self._post(body)
+        return self._post(body, command='system.multicall')
 
     def list_methods(self, params=None):
         data = self.call('system.listMethods', params)
@@ -162,5 +204,8 @@ class RTorrentRpc:
         try:
             g.add_attributes(data, commands)
         except ValueError as e:
-            raise RpcError(str(e))
+            # model.add_attribute: a per-command fault struct inside system.multicall
+            raise RpcError(str(e), 'this rtorrent lacks a command rtremote needs; rtremote requires '
+                           'rtorrent >= 0.16 (system.api_version >= 26)', WHERE_RTORRENT,
+                           command='system.multicall') from e
         return g

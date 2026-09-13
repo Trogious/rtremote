@@ -287,6 +287,47 @@ tests. `network.max_open_files.set` and
 `network.http.max_total_connections.set` are no-op stubs in master: never
 expose them as setters.
 
+### Diagnostic logging (who is to blame: rtorrent, app, or rtremote)
+
+Every log line carries a `where` column (`rtorrent` / `app` / `rtremote`)
+naming the component a user should look at, followed by an optional
+` -> hint` saying what to check; format
+`time|LEVEL|where|line|message -> hint`. Rules for new code:
+
+- Log through `diag.rtorrent(...)`, `diag.app(...)`, `diag.rtremote(...)`
+  (`utils.Diag`), never bare `logger.info/error` (plain `logger.debug` with
+  `extra={'where': ...}` is fine for chatter). Third-party loggers (`asyncio`,
+  `websockets.server`) are routed into the same file with a default `where`.
+- **Classify once.** `describe_failure(e)` in `server_wss.py` maps any
+  exception to `(where, message, hint, is_bug)`; `log_failure(context, e)`
+  logs it and `error_text(where, message)` builds the JSON-RPC error text the
+  app shows (prefixed `rtorrent: ` / `app: ` / `rtremote: `). Handlers must
+  not invent their own wording. Tracebacks are logged only for `is_bug`
+  (an unexpected exception type = an rtremote bug).
+- Transport and RPC errors carry their own diagnosis: `scgi.ScgiError`
+  (`classify_socket_error`: socket missing / refused / permission / timeout /
+  reset) and `rpc.RpcError` (`classify_fault`: unknown hash → `app`,
+  untrusted-rejected → `rtremote` bug, unknown command → rtorrent too old,
+  non-XML answer → wrong socket). Both have `.where` and `.hint`.
+- rtorrent outages are collapsed by `Outage` in the updater: one line when
+  polling starts failing (message + hint), one on recovery with the duration;
+  identical repeats go to DEBUG. Do not log per failed tick.
+- TLS: asyncio swallows handshake failures (SSLError is an OSError, logged
+  only in loop debug mode), so `DiagnosingSSLContext` wraps each connection's
+  `SSLObject.do_handshake`/first `read`, and a `weakref.finalize` reports a
+  handshake still pending when its `SSLObject` is freed (an app that rejects
+  the certificate just closes the socket, and asyncio then never touches the
+  object again). The wrappers must hold only a weak reference to the
+  `SSLObject`, or the finalizer waits for the cyclic GC. These produce the
+  "client rejected this server's TLS certificate" / "closed the connection
+  during the TLS handshake" / "plain text to the TLS port" lines. Keep this
+  when touching the listener.
+- Startup logs a banner (version, protocol level, python/websockets versions,
+  full config, missing-socket warning, default-secret warning) and the
+  listener/cert/port failures are diagnosed with hints before re-raising.
+- `test_log_names_the_component` and the outage test assert the tags; extend
+  them when adding a new failure class.
+
 ### Versioning
 
 `RTR_VERSION` in `server_wss.py` is the literal string
@@ -305,7 +346,7 @@ version if it starts with `v` — which is why release tags are `v*`.
 | `scgi.py`               | SCGI transport (UNIX + TCP), timeouts, netstring framing.  |
 | `model.py`              | Data classes for Global/Torrent/Tracker/Peer/File/Client.  |
 | `diffs.py`              | Map and torrent-list diff helpers.                         |
-| `utils.py`              | Logger (rotating file), SHA1 helper, env-path resolver.    |
+| `utils.py`              | Logger (rotating file, `where` column), `Diag`, SHA1 helper, env-path resolver. |
 | `plugins/`              | Plugin package; ships `DiskUsage`.                         |
 | `client_wss.py`         | Minimal local WSS client useful for ad-hoc smoke testing.  |
 | `start.sh`              | Env-var wrapper that launches the server.                  |
@@ -330,6 +371,7 @@ All read at startup; `start.sh` is the canonical place to set them.
 | `RTR_SCGI_TIMEOUT`                | `30`                                   | Per-operation SCGI socket timeout (seconds).       |
 | `RTR_PID_PATH`                    | `./wss_server.pid`                     | PID file written after daemonize.                  |
 | `RTR_LOG_PATH`                    | `./rtr_wss_server.log`                 | Rotating log file (4 × 200 KiB).                   |
+| `RTR_LOG_LEVEL`                   | `INFO`                                 | Log level name (`DEBUG` for per-message detail).   |
 | `RTR_PLUGINS_DISK_USAGE_PATHS`    | `/`                                    | Colon-separated paths for the disk-usage plugin.   |
 | `RTR_DATA_ROOT`                   | `` (empty)                             | Root that erase-with-data / move-data are confined to; empty disables both. |
 
