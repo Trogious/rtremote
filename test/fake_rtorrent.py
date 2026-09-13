@@ -8,7 +8,7 @@ are a childless <data/>).
 Speaks just enough of the XML-RPC dialect for server_wss.py:
 - system.multicall (global getters; unknown commands answer with a fault
   struct in place of the value array, like the real thing)
-- d.multicall2 / t.multicall / p.multicall / f.multicall
+- d.multicall / t.multicall / p.multicall / f.multicall
 - plain getters and *.set setters (for update-propagation tests)
 - fake.add_torrent / fake.remove_torrent control methods
 """
@@ -17,6 +17,12 @@ import socketserver
 import threading
 from xml.etree.ElementTree import fromstring
 from xml.sax.saxutils import escape
+
+
+# names rtorrent master keeps only as deprecated redirects: the fake refuses
+# them so a regression back to the old names is caught by the smoke tests
+DEPRECATED_COMMANDS = {'d.multicall2', 'network.open_sockets', 'network.max_open_sockets',
+                       'network.max_open_sockets.set'}
 
 
 def _fault(code, string):
@@ -57,8 +63,8 @@ class State:
             'throttle.max_downloads': 50,
             'throttle.max_uploads': 50,
             'network.http.max_total_connections': 32,
-            'network.open_sockets': 3,
-            'network.max_open_sockets': 1048576,
+            'system.sockets.size': 3,
+            'system.sockets.max_size': 1048576,
             'throttle.unchoked_uploads': 0,
             'throttle.unchoked_downloads': 0,
             'network.listen.port': 22400,
@@ -189,18 +195,21 @@ class Responder:
         method = root.find('methodName').text
         params = _parse_params(root.find('params'))
 
+        if method in DEPRECATED_COMMANDS:
+            return _fault(-506, "Method '%s' not defined" % method)
+
         if method == 'system.multicall':
             results = []
             for call in params[0]:
                 name = call['methodName']
                 with state.lock:
-                    if name in state.globals:
+                    if name in state.globals and name not in DEPRECATED_COMMANDS:
                         results.append(self.array([self.value(state.globals[name])]))
                     else:
                         results.append(_fault_struct(-506, "Method '%s' not defined" % name))
             return _response(self.array(results))
 
-        if method == 'd.multicall2':
+        if method == 'd.multicall':
             view = params[1] if len(params) > 1 else 'main'
             commands = params[2:]
             with state.lock:

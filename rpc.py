@@ -117,7 +117,9 @@ class RTorrentRpc:
         return data
 
     def d_multicall(self, commands, view):
-        data = self.multicall('d.multicall2', ['', view] + commands)
+        # d.multicall2 is a deprecated redirect in rtorrent 0.16; the wire shape
+        # (target '', view, commands...) is identical for d.multicall
+        data = self.multicall('d.multicall', ['', view] + commands)
         return Torrent.get_torrents(data, commands)
 
     def t_multicall(self, hash, commands):

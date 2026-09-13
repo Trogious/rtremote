@@ -11,7 +11,7 @@ class Remote:
     GLOBAL_COMMANDS = [
         'throttle.global_down.rate', 'throttle.global_up.rate', 'throttle.global_down.max_rate', 'throttle.global_up.max_rate',
         'network.max_open_files', 'throttle.max_downloads', 'throttle.max_uploads', 'network.http.max_total_connections',
-        'network.open_sockets', 'network.max_open_sockets', 'throttle.unchoked_uploads', 'throttle.unchoked_downloads',
+        'system.sockets.size', 'system.sockets.max_size', 'throttle.unchoked_uploads', 'throttle.unchoked_downloads',
         'network.listen.port', 'network.listen.port.range', 'system.client_version', 'system.library_version', 'system.hostname',
         'system.pid', 'system.cwd', 'session.path', 'system.api_version',
         'network.http.current_open', 'network.total_handshakes', 'network.open_files',
@@ -21,6 +21,8 @@ class Remote:
     GLOBAL_ALIASES = {
         'network_listen_port_range': 'network_port_range',
         'network_http_max_total_connections': 'network_http_max_open',
+        'system_sockets_size': 'network_open_sockets',
+        'system_sockets_max_size': 'network_max_open_sockets',
     }
     TORRENT_ALIASES = {
         'tracker_has_active_not_scrape': 'has_active_not_scrape',

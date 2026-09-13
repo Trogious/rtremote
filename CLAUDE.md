@@ -151,7 +151,7 @@ change, so an idle client receives nothing.
   dependency).
 - **`rpc.py`** (`RTorrentRpc`) — builds raw XML-RPC method calls, posts them
   over SCGI, parses responses with `xmljson.parker`, and wraps the typed
-  multicalls: `d.multicall2` (downloads), `t.multicall` (trackers),
+  multicalls: `d.multicall` (downloads), `t.multicall` (trackers),
   `p.multicall` (peers), `f.multicall` (files), `system.multicall` (batched
   global getters). Important details:
   - All string parameters are XML-escaped (`xml.sax.saxutils.escape`) — raw
@@ -177,6 +177,8 @@ change, so an idle client receives nothing.
   0.16 are requested under their new names and aliased back:
   - `network.listen.port.range` → field `network_port_range`
   - `network.http.max_total_connections` → field `network_http_max_open`
+  - `system.sockets.size` → field `network_open_sockets`
+  - `system.sockets.max_size` → field `network_max_open_sockets`
   - `d.tracker.has_active_not_scrape=` → field `has_active_not_scrape`
   When that flag is 1, the torrent's tracker digest (group, url,
   `is_busy_not_scrape`) is embedded under `trackers` for the app's announce
@@ -232,13 +234,15 @@ timeout the client's transport is aborted so one stuck client cannot stall
 the updater or other clients. Failed sends are logged; the client registry is
 cleaned up when the handler's `finally` runs.
 
-### Deprecated rtorrent names still in use (migrate)
+### Deprecated rtorrent names (migrated)
 
 rtorrent master keeps `d.multicall2`, `network.open_sockets` and
 `network.max_open_sockets` only as deprecated redirects marked for removal
-(`src/main.cc`). Move to `d.multicall`, `system.sockets.size` and
-`system.sockets.max_size` (keeping the wire field names via the alias maps)
-before adding write support. `network.max_open_files.set` and
+(`src/main.cc`). rtremote now calls `d.multicall`, `system.sockets.size` and
+`system.sockets.max_size`; the wire field names (`network_open_sockets`,
+`network_max_open_sockets`) are preserved via `GLOBAL_ALIASES`, and the fake
+rtorrent faults on the old names so a regression is caught by the smoke
+tests. `network.max_open_files.set` and
 `network.http.max_total_connections.set` are no-op stubs in master: never
 expose them as setters.
 

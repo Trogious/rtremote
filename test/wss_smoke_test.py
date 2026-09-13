@@ -195,6 +195,10 @@ def test_register_main(srv):
         assert result['global']['network_http_max_open'] == 32
         assert result['global']['system_api_version'] == 26
         assert result['global']['network_port_range'] == '22400-22400'
+        # wire names must stay stable although the underlying rtorrent commands
+        # are now system.sockets.size / system.sockets.max_size
+        assert result['global']['network_open_sockets'] == 3
+        assert result['global']['network_max_open_sockets'] == 1048576
         hashes = [t['hash'] for t in result['torrents']]
         assert hashes == [HASH_A, HASH_B]
         torrent_b = result['torrents'][1]
