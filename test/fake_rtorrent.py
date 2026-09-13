@@ -9,8 +9,11 @@ Speaks just enough of the XML-RPC dialect for server_wss.py:
 - system.multicall (global getters; unknown commands answer with a fault
   struct in place of the value array, like the real thing)
 - d.multicall / t.multicall / p.multicall / f.multicall
-- plain getters and *.set setters (for update-propagation tests)
-- fake.add_torrent / fake.remove_torrent control methods
+- plain getters and *.set / *.set_kb setters (for update-propagation tests);
+  requests carrying UNTRUSTED_CONNECTION=1 are rejected for commands outside
+  rtorrent's untrusted-safe allowlist, like the real thing
+- fake.add_torrent / fake.remove_torrent / fake.fail_next_set /
+  fake.was_untrusted control methods
 """
 import os
 import socketserver
@@ -23,6 +26,16 @@ from xml.sax.saxutils import escape
 # them so a regression back to the old names is caught by the smoke tests
 DEPRECATED_COMMANDS = {'d.multicall2', 'network.open_sockets', 'network.max_open_sockets',
                        'network.max_open_sockets.set'}
+
+# setters rtorrent marks rpc.mark_safe (usable on UNTRUSTED_CONNECTION=1
+# requests), per v0.16.22 and master; like the real thing, the fake rejects
+# any other command arriving on an untrusted request - this catches rtremote
+# sending the untrusted header for a command rtorrent does not allow it on
+UNTRUSTED_SAFE_SETTERS = {
+    'throttle.global_up.max_rate.set_kb', 'throttle.global_down.max_rate.set_kb',
+    'throttle.max_uploads.global.set', 'throttle.max_downloads.global.set',
+    'throttle.max_uploads.set', 'throttle.max_downloads.set',
+}
 
 
 def _fault(code, string):
@@ -74,12 +87,18 @@ class State:
             'network.open_files': 0,
             'throttle.max_unchoked_uploads': 2,
             'throttle.max_unchoked_downloads': 2,
+            'throttle.max_uploads.global': 0,
+            'throttle.max_downloads.global': 0,
         }
         # keyed by info hash; field names are rtorrent command names
         self.torrents = {}
         self.trackers = {}
         self.peers = {}
         self.files = {}
+        # methods seen with the UNTRUSTED_CONNECTION=1 header (fake.was_untrusted)
+        self.untrusted_methods = set()
+        # when set (fake.fail_next_set), the next setter call returns a fault
+        self.fail_next_set = False
 
     def add_torrent(self, hash, name, size, complete=0, is_open=1, is_active=1,
                     down_rate=0, up_rate=0, trackers=None, has_active_not_scrape=0):
@@ -189,7 +208,7 @@ class Responder:
             vals.append(self.value(fields[base]))
         return self.array(vals)
 
-    def handle(self, body):
+    def handle(self, body, untrusted=False):
         state = self.state
         root = fromstring(body)
         method = root.find('methodName').text
@@ -197,6 +216,13 @@ class Responder:
 
         if method in DEPRECATED_COMMANDS:
             return _fault(-506, "Method '%s' not defined" % method)
+
+        if untrusted:
+            with state.lock:
+                state.untrusted_methods.add(method)
+            if method not in UNTRUSTED_SAFE_SETTERS:
+                # message shape matches rtorrent's untrusted_error
+                return _fault(-501, 'Command "%s" is not allowed for untrusted connections.' % method)
 
         if method == 'system.multicall':
             results = []
@@ -237,6 +263,25 @@ class Responder:
                 state.torrents.pop(params[0], None)
             return _response(self.value(0))
 
+        if method == 'fake.fail_next_set':
+            with state.lock:
+                state.fail_next_set = True
+            return _response(self.value(0))
+
+        if method == 'fake.was_untrusted':
+            with state.lock:
+                return _response(self.value(1 if params[0] in state.untrusted_methods else 0))
+
+        if method.endswith('.set_kb'):
+            # rate setters take KB and store bytes (CMD2_ANY_VALUE_KB)
+            base = method[:-len('.set_kb')]
+            with state.lock:
+                if state.fail_next_set:
+                    state.fail_next_set = False
+                    return _fault(-501, 'injected fault')
+                state.globals[base] = params[-1] * 1024
+            return _response(self.value(0))
+
         if method.endswith('.set'):
             base = method[:-4]
             if base.startswith('d.'):
@@ -247,6 +292,9 @@ class Responder:
                     state.torrents[hash][base] = value
                 return _response(self.value(value))
             with state.lock:
+                if state.fail_next_set:
+                    state.fail_next_set = False
+                    return _fault(-501, 'injected fault')
                 state.globals[base] = params[-1]
             return _response(self.value(0))
 
@@ -287,8 +335,9 @@ class ScgiHandler(socketserver.BaseRequestHandler):
                 return
             rest += chunk
         body = rest[:content_length].decode('utf8')
+        untrusted = headers.get('UNTRUSTED_CONNECTION') == '1'
         try:
-            resp = self.server.responder.handle(body)
+            resp = self.server.responder.handle(body, untrusted)
         except Exception as e:
             resp = _fault(-500, 'fake rtorrent error: %r' % e)
         payload = resp.encode('utf8')

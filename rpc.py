@@ -48,9 +48,9 @@ class RTorrentRpc:
             value = escape(str(value))
         return '<param><value><%s>%s</%s></value></param>' % (tag, value, tag)
 
-    def _post(self, body):
+    def _post(self, body, extra_headers=None):
         scgi = Scgi(self.host_port)
-        resp = scgi.post(body)
+        resp = scgi.post(body, extra_headers)
         start = resp.find('<')
         if start < 0:
             raise RpcError('no XML found in SCGI response')
@@ -74,14 +74,21 @@ class RTorrentRpc:
                 pass
             raise RpcError('rtorrent fault %s: %s' % (code, string))
 
-    def call(self, method, params=None):
+    def call(self, method, params=None, extra_headers=None):
         body = "<?xml version='1.0'?><methodCall><methodName>" + \
             escape(method) + "</methodName><params>"
         if params:
             for p in params:
                 body += RTorrentRpc._param_xml(p)
         body += "</params></methodCall>"
-        return self._post(body)
+        return self._post(body, extra_headers)
+
+    def set_value(self, command, value, untrusted=False):
+        # untrusted=True sends rtorrent's UNTRUSTED_CONNECTION=1 SCGI header, so
+        # rtorrent's own untrusted-safe allowlist applies as defence in depth;
+        # only usable for commands rtorrent marks safe (rpc.mark_safe)
+        headers = [('UNTRUSTED_CONNECTION', 1)] if untrusted else None
+        return self.call(command, [('string', ''), ('i8', int(value))], headers)
 
     def get_struct(self, command):
         s = '<struct><member><name>methodName</name><value><string>' + escape(command) + \

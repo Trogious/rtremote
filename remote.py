@@ -16,6 +16,7 @@ class Remote:
         'system.pid', 'system.cwd', 'session.path', 'system.api_version',
         'network.http.current_open', 'network.total_handshakes', 'network.open_files',
         'throttle.max_unchoked_uploads', 'throttle.max_unchoked_downloads',
+        'throttle.max_uploads.global', 'throttle.max_downloads.global',
     ]
     # attribute produced by the rtorrent command -> wire field name the app expects
     GLOBAL_ALIASES = {
@@ -26,6 +27,25 @@ class Remote:
     }
     TORRENT_ALIASES = {
         'tracker_has_active_not_scrape': 'has_active_not_scrape',
+    }
+    # set_global allowlist: wire field -> (rtorrent setter, min, max, untrusted-safe).
+    # Values out of [min, max] (and non-integers) are rejected before any RPC is
+    # built; nothing outside this map is ever settable. XMLRPC_I8_MAX keeps the
+    # value encodable as XML-RPC <i8>. untrusted-safe mirrors rtorrent's own
+    # mark_safe allowlist (verified against v0.16.22 and master): those setters
+    # also carry the UNTRUSTED_CONNECTION=1 header as defence in depth;
+    # system.sockets.max_size.set and network.listen.port.set are NOT on
+    # rtorrent's list, so they must go out as trusted calls.
+    XMLRPC_I8_MAX = 2 ** 63 - 1
+    GLOBAL_SETTERS = {
+        'throttle_global_up_max_rate': ('throttle.global_up.max_rate.set_kb', 0, XMLRPC_I8_MAX, True),
+        'throttle_global_down_max_rate': ('throttle.global_down.max_rate.set_kb', 0, XMLRPC_I8_MAX, True),
+        'throttle_max_uploads_global': ('throttle.max_uploads.global.set', 0, XMLRPC_I8_MAX, True),
+        'throttle_max_downloads_global': ('throttle.max_downloads.global.set', 0, XMLRPC_I8_MAX, True),
+        'throttle_max_uploads': ('throttle.max_uploads.set', 0, XMLRPC_I8_MAX, True),
+        'throttle_max_downloads': ('throttle.max_downloads.set', 0, XMLRPC_I8_MAX, True),
+        'network_max_open_sockets': ('system.sockets.max_size.set', 0, XMLRPC_I8_MAX, False),
+        'network_listen_port': ('network.listen.port.set', 1, 65535, False),
     }
 
     def __init__(self, sock_path):
@@ -41,6 +61,11 @@ class Remote:
         g = self.rpc.global_data(Remote.GLOBAL_COMMANDS)
         Remote.apply_aliases(g, Remote.GLOBAL_ALIASES)
         return g
+
+    def set_global(self, key, value):
+        # key must have been validated against GLOBAL_SETTERS by the caller
+        command, _, _, untrusted_safe = Remote.GLOBAL_SETTERS[key]
+        self.rpc.set_value(command, value, untrusted=untrusted_safe)
 
     def get_torrents(self, view='main'):
         params = ['d.hash=', 'd.name=', 'd.size_bytes=', 'd.bytes_done=', 'd.complete=', 'd.up.rate=', 'd.down.rate=', 'd.up.total=',

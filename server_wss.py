@@ -33,8 +33,9 @@ RTR_SEND_TIMEOUT = 10  # seconds to wait for a single client send before droppin
 logger = Logger.get_logger()
 RTR_VERSION = '__RTR_VERSION_PLACEHOLDER__'
 # wire-contract level for the Android app's feature gating; bump only when the
-# protocol changes (new method, new field, changed shape) - never at release time
-RTR_PROTOCOL_VERSION = 1
+# protocol changes (new method, new field, changed shape) - never at release time.
+# 2 = set_global + throttle.max_uploads/downloads.global in the global data
+RTR_PROTOCOL_VERSION = 2
 INFO_HASH_RE = re.compile('[0-9A-Fa-f]{40}')
 
 JSONRPC_METHOD_NOT_FOUND = -32601
@@ -53,6 +54,7 @@ class Cached:
     torrents_lock = None
     clients = set()
     clients_lock = None
+    update_now = None  # set after a successful write to trigger an immediate updater tick
     SHORT_CACHES_NO = 4
     SHORT_CACHES = [TTLCache(maxsize=4096, ttl=RTR_SHORT_CACHE_TTL) for _ in range(SHORT_CACHES_NO)]
     SHORT_LOCKS = [RLock() for _ in range(SHORT_CACHES_NO)]
@@ -66,6 +68,7 @@ class Cached:
         Cached.global_data_lock = asyncio.Lock()
         Cached.torrents_lock = asyncio.Lock()
         Cached.clients_lock = asyncio.Lock()
+        Cached.update_now = asyncio.Event()
 
     @staticmethod
     async def update_global(new_global):
@@ -288,6 +291,9 @@ async def process_request(request, websocket):
         if isinstance(params, dict) and 'hash' in params:
             response_json = await handle_method_with_hash(req['id'], req['method'], params['hash'])
             return prepare_response(response_json), True
+        if isinstance(params, dict) and 'key' in params:
+            response_json = await handle_set_global(req['id'], req['method'], params)
+            return prepare_response(response_json), True
     response_json = await handle_register(req, websocket)
     if response_json is None:
         return None, False
@@ -348,9 +354,41 @@ async def handle_method_with_hash(req_id, method, hash):
     return get_json_response(req_id, {result_key: [x.__dict__ for x in data]})
 
 
+async def handle_set_global(req_id, method, params):
+    # the only write method (protocol level 2). Everything is validated against
+    # the server-side allowlist before any rtorrent command is built; clients
+    # never supply command text
+    if method != 'set_global':
+        return get_json_error(req_id, JSONRPC_METHOD_NOT_FOUND, 'unknown method: %s' % method)
+    key = params.get('key')
+    setter = Remote.GLOBAL_SETTERS.get(key) if isinstance(key, str) else None
+    if setter is None:
+        return get_json_error(req_id, JSONRPC_INVALID_PARAMS, 'key is not settable')
+    value = params.get('value')
+    _, min_value, max_value, _ = setter
+    # bool is an int subclass in Python; a JSON true/false must not pass as 1/0
+    if isinstance(value, bool) or not isinstance(value, int) or not min_value <= value <= max_value:
+        return get_json_error(req_id, JSONRPC_INVALID_PARAMS, 'invalid value')
+    try:
+        await asyncio.to_thread(Remote(SOCK_PATH).set_global, key, value)
+    except RpcError as e:
+        logger.info('set_global(%s=%s) failed: %s' % (key, value, e))
+        return get_json_error(req_id, JSONRPC_INTERNAL_ERROR, str(e))
+    except Exception as e:
+        logger.error('set_global(%s=%s) failed' % (key, value), exc_info=e)
+        return get_json_error(req_id, JSONRPC_INTERNAL_ERROR, 'internal error')
+    logger.info('set_global: %s=%s' % (key, value))
+    # push the change to every client as a normal global diff right away
+    Cached.update_now.set()
+    return get_json_response(req_id, {'key': key, 'value': value})
+
+
 async def global_data_updater(ready):
     remote = Remote(SOCK_PATH)
     while True:
+        # cleared before polling: a write landing mid-poll re-triggers a fresh
+        # tick instead of being lost until the next interval
+        Cached.update_now.clear()
         try:
             new_data = {}
             data = await asyncio.to_thread(remote.get_global)
@@ -378,7 +416,11 @@ async def global_data_updater(ready):
         except Exception as e:
             # a failed poll (e.g. rtorrent restarting) must not kill the server
             logger.error('updater tick failed, retrying in %ds: %s' % (RTR_RETR_INTERVAL, e), exc_info=e)
-        await asyncio.sleep(RTR_RETR_INTERVAL)
+        try:
+            # interval sleep that a successful write cuts short (see handle_set_global)
+            await asyncio.wait_for(Cached.update_now.wait(), RTR_RETR_INTERVAL)
+        except asyncio.TimeoutError:
+            pass
 
 
 async def short_caches_cleaner():

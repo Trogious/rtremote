@@ -80,12 +80,14 @@ The Android app speaks JSON-RPC 2.0 over a single persistent secure WebSocket.
   `register` response next to `version` (constant `RTR_PROTOCOL_VERSION` in
   `server_wss.py`, not substituted at build time). Bumped **only** when the
   wire contract changes (new method, new field, changed shape). The app treats
-  an absent field as 1 (today's contract) and hides controls whose minimum
+  an absent field as 1 and hides controls whose minimum
   level the server does not meet. It is not a capability list and not
   configuration: **rtremote never gates** — it is an intermediary and forwards
   whatever rtorrent accepts. Monetization (in-app purchases) lives entirely in
-  the app; nothing about entitlements is ever on the wire. Planned levels:
-  2 = global setters, 3 = per-torrent actions, 4 = add torrent / file
+  the app; nothing about entitlements is ever on the wire. Levels: 1 = the
+  original read-only contract, 2 (current) = `set_global` plus the
+  `throttle_max_uploads_global` / `throttle_max_downloads_global` fields.
+  Planned: 3 = per-torrent actions, 4 = add torrent / file
   priorities, 5 = per-torrent tuning and peers, 6 = erase with data, add
   tracker, add-torrent `directory` / `label` options, 7 = scheduled caps
   (rtremote-owned, fixed-name `schedule` entries built only from validated
@@ -98,6 +100,23 @@ The Android app speaks JSON-RPC 2.0 over a single persistent secure WebSocket.
   rejected with a JSON-RPC error). Results are served from a short TTL cache
   (`RTR_SHORT_CACHE_TTL`, default 5 s) so multiple clients hitting the same
   torrent don't hammer rtorrent.
+- **`set_global`** — the only write method (protocol level 2). Params are
+  `{"key": <wire field>, "value": <int>}`; the key must be one of the eight
+  entries in `Remote.GLOBAL_SETTERS` (`throttle_global_up_max_rate`,
+  `throttle_global_down_max_rate` — the value is KB for these two, mapped to
+  `throttle.global_*.max_rate.set_kb` — `throttle_max_uploads_global`,
+  `throttle_max_downloads_global`, `throttle_max_uploads`,
+  `throttle_max_downloads`, `network_max_open_sockets`,
+  `network_listen_port`) and the value an integer inside the entry's
+  [min, max] range (>= 0; listen port 1..65535). Any other key, a
+  non-integer (including booleans) or an out-of-range value is rejected with
+  `-32602` before any rtorrent command is built; an rtorrent fault surfaces
+  as `-32603`. On success the updater ticks immediately
+  (`Cached.update_now`), so the change reaches every client as a normal
+  global diff without waiting for `RTR_RETR_INTERVAL`. The dispatch in
+  `process_request` routes a registered client's params dict containing
+  `"key"` to this handler, exactly as `"hash"` routes to the detail methods;
+  unregistered sockets are dropped as for every other method.
 
 Error handling, by client state:
 - **Unauthenticated** sockets get no feedback: invalid JSON, malformed
@@ -306,14 +325,24 @@ CLI flags: `-f` / `--foreground` — do not daemonize.
   `hmac.compare_digest`. SHA1 here is a **wire-protocol constant** — changing
   the algorithm breaks every existing client/config pair, so improvements
   must be coordinated with the app.
-- The server is read-only toward rtorrent today: no client input reaches
-  rtorrent except a strictly validated 40-hex info hash (and even that is
-  XML-escaped). When write methods land, keep the same shape: every request
-  is typed and validated server-side (hashes, integers, magnet / http URIs,
-  labels, paths under a configured root), rtremote builds every rtorrent
+- Writes exist since protocol level 2, but only through `set_global` and
+  only for the eight global keys in the `Remote.GLOBAL_SETTERS` allowlist.
+  The allowlist rule is binding for every write method, present and future:
+  every request is typed and validated server-side (hashes, integers, per-key
+  ranges, magnet / http URIs, labels, paths under a configured root),
+  rtremote maps the wire key to the rtorrent command and builds every
   command string itself, and no client-supplied command text is ever
   forwarded (`execute.*`, `system.shutdown.*`, `session.path.set` and raw
-  `schedule` strings stay unreachable).
+  `schedule` strings stay unreachable). Reads still forward nothing but a
+  strictly validated 40-hex info hash (and even that is XML-escaped).
+- Write calls carry rtorrent's `UNTRUSTED_CONNECTION=1` SCGI header where
+  rtorrent's own untrusted-safe allowlist (`rpc.mark_safe`) covers the
+  command, so rtorrent enforces a second allowlist as defence in depth.
+  Verified against rtorrent v0.16.22 and master: the six throttle setters
+  are on that list; `system.sockets.max_size.set` and
+  `network.listen.port.set` are **not** and must go out as normal trusted
+  calls (the untrusted-safe flag lives per entry in
+  `Remote.GLOBAL_SETTERS`).
 
 ## Testing
 
@@ -327,15 +356,21 @@ The `test/` package is pytest-driven:
   `get_peers`, `get_trackers`, the `disk_usage` plugin, and live update
   propagation for global settings and per-torrent attributes.
 - **`fake_rtorrent.py`** — an in-process fake rtorrent SCGI/XML-RPC server
-  mimicking rtorrent 0.16 (current command names, api_version 26, compact
-  tinyxml2 XML, per-command fault structs for unknown commands in
-  `system.multicall`; global getters/setters, all four multicalls,
-  `fake.add_torrent` / `fake.remove_torrent` control methods).
+  mimicking rtorrent 0.16 (current command names — it faults on the
+  deprecated ones — api_version 26, compact tinyxml2 XML, per-command fault
+  structs for unknown commands in `system.multicall`; global
+  getters/setters incl. `.set_kb` KB scaling, enforcement of the
+  untrusted-safe allowlist for `UNTRUSTED_CONNECTION=1` requests, all four
+  multicalls, `fake.add_torrent` / `fake.remove_torrent` /
+  `fake.fail_next_set` / `fake.was_untrusted` control methods).
 - **`wss_smoke_test.py`** — full end-to-end protocol suite against the fake,
   **no rtorrent or Linux required**; runs the real daemonized server in a
   temp dir and covers registration per view, details, diff pushes, per-view
-  `new` filtering, wire-name aliasing, all error paths, view re-registration,
-  and updater resilience across an rtorrent outage.
+  `new` filtering, wire-name aliasing, `set_global` (each rejection path,
+  untrusted-safe header usage, the immediate post-write push - proven
+  against a second server instance with a long poll interval), all error
+  paths, view re-registration, and updater resilience across an rtorrent
+  outage.
 - **`plugins_test.py`** — direct unit tests for plugins.
 
 Local quick run (any OS): `PYTHONPATH=. pytest test/plugins_test.py test/wss_smoke_test.py`

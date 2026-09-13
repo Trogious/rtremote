@@ -21,12 +21,15 @@ class Scgi:
         return name.encode(Scgi.ENCODING) + bytes(1) + str(val).encode(Scgi.ENCODING) + bytes(1)
 
     @staticmethod
-    def get_headers(content_len, method='POST'):
+    def get_headers(content_len, method='POST', extra_headers=None):
         # CONTENT_LENGTH must be the first header: rtorrent rejects the request otherwise
         h = Scgi.get_header('CONTENT_LENGTH', content_len)
         h += Scgi.get_header('SCGI', 1)
         h += Scgi.get_header('REQUEST_METHOD', method)
         h += Scgi.get_header('REQUEST_URI', '/RPC2')
+        if extra_headers:
+            for name, value in extra_headers:
+                h += Scgi.get_header(name, value)
         return netstring(h)
 
     def get_connected_socket(self):
@@ -50,9 +53,9 @@ class Scgi:
             raise
         return sock
 
-    def post(self, body):
+    def post(self, body, extra_headers=None):
         payload = body.encode(Scgi.ENCODING)
-        req = Scgi.get_headers(len(payload)) + payload
+        req = Scgi.get_headers(len(payload), extra_headers=extra_headers) + payload
         sock = self.get_connected_socket()
         try:
             sock.sendall(req)
