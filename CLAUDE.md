@@ -86,7 +86,12 @@ The Android app speaks JSON-RPC 2.0 over a single persistent secure WebSocket.
   whatever rtorrent accepts. Monetization (in-app purchases) lives entirely in
   the app; nothing about entitlements is ever on the wire. Planned levels:
   2 = global setters, 3 = per-torrent actions, 4 = add torrent / file
-  priorities, 5 = per-torrent tuning and peers.
+  priorities, 5 = per-torrent tuning and peers, 6 = erase with data, add
+  tracker, add-torrent `directory` / `label` options, 7 = scheduled caps
+  (rtremote-owned, fixed-name `schedule` entries built only from validated
+  numbers) and named throttle groups, 8 = custom views and move data (the
+  only feature that makes rtremote touch user files; restricted to a
+  configured root).
 - **`get_files` / `get_peers` / `get_trackers`** — request a per-torrent
   detail list, identified by `{"hash": "<info_hash>"}`. The hash must be a
   40-char hex string (it is embedded into an XML-RPC call; anything else is
@@ -297,9 +302,14 @@ CLI flags: `-f` / `--foreground` — do not daemonize.
   `hmac.compare_digest`. SHA1 here is a **wire-protocol constant** — changing
   the algorithm breaks every existing client/config pair, so improvements
   must be coordinated with the app.
-- The server is read-only toward rtorrent by design: no client input reaches
+- The server is read-only toward rtorrent today: no client input reaches
   rtorrent except a strictly validated 40-hex info hash (and even that is
-  XML-escaped).
+  XML-escaped). When write methods land, keep the same shape: every request
+  is typed and validated server-side (hashes, integers, magnet / http URIs,
+  labels, paths under a configured root), rtremote builds every rtorrent
+  command string itself, and no client-supplied command text is ever
+  forwarded (`execute.*`, `system.shutdown.*`, `session.path.set` and raw
+  `schedule` strings stay unreachable).
 
 ## Testing
 
