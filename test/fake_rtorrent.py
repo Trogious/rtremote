@@ -34,6 +34,18 @@ from xml.sax.saxutils import escape
 DEPRECATED_COMMANDS = {'d.multicall2', 'network.open_sockets', 'network.max_open_sockets',
                        'network.max_open_sockets.set'}
 
+# custom-view filter conditions (the exact strings server_wss.VIEW_FILTER_PRESETS
+# installs via view.filter) mapped to predicates, so an opened custom view returns
+# the same subset the real rtorrent would. An empty/unknown condition means 'all'.
+CONDITION_PREDS = {
+    '': None,
+    'greater=value=$d.up.rate=,value=0': lambda t: t['d.up.rate'] > 0,
+    'd.complete=,false=': lambda t: t['d.complete'] == 0,
+    'd.complete=': lambda t: t['d.complete'] == 1,
+    'and={d.complete=,d.is_open=}': lambda t: t['d.complete'] == 1 and t['d.is_open'] == 1,
+    'not=$d.is_open=': lambda t: t['d.is_open'] == 0,
+}
+
 # commands rtorrent marks rpc.mark_safe (usable on UNTRUSTED_CONNECTION=1
 # requests), per v0.16.22 and master; like the real thing, the fake rejects
 # any other command arriving on an untrusted request - this catches rtremote
@@ -121,6 +133,7 @@ class State:
         # M6/M7 registries the fake records so behaviour is observable in tests
         self.throttle_groups = {}  # name -> {'up': bytes, 'down': bytes}
         self.views = set()
+        self.view_filters = {}     # custom view name -> rtorrent filter condition string
         self.schedules = {}        # name -> command string
         self._added_counter = 0
 
@@ -195,6 +208,7 @@ class State:
     def view_hashes(self, view):
         with self.lock:
             items = list(self.torrents.items())
+            cond = self.view_filters.get(view)  # custom view's filter condition, if any
         if view in ('main', 'default', ''):
             return [h for h, _ in items]
         if view == 'name':
@@ -211,6 +225,13 @@ class State:
         }
         if view in preds:
             return [h for h, t in items if preds[view](t)]
+        # custom view (M7): apply the rtorrent filter condition rtremote installed
+        # via view.filter, mapped from server_wss.VIEW_FILTER_PRESETS values
+        if cond is not None:
+            cpred = CONDITION_PREDS.get(cond)
+            if cpred is None:  # empty ('all') or unrecognised -> show everything
+                return [h for h, _ in items]
+            return [h for h, t in items if cpred(t)]
         return []
 
     def populate_default(self):
@@ -465,7 +486,10 @@ class Responder:
         # ---- custom views (M7) and scheduling (M6): accept and record ----
         if method in ('view.add', 'view.filter', 'view.filter_on', 'view.sort_new'):
             with state.lock:
-                state.views.add(params[1] if method != 'view.add' else params[1])
+                name = params[1]
+                state.views.add(name)
+                if method == 'view.filter' and len(params) > 2:
+                    state.view_filters[name] = params[2]
             return _response(self.value(0))
         if method in ('schedule', 'schedule.remove', 'schedule.if_absent'):
             with state.lock:

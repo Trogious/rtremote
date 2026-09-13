@@ -912,3 +912,38 @@ def test_m2_add_torrent_raw(srv):
         assert (await _call(ws, 'add_torrent', {'content_b64': 'not!base64', 'start': True}, 401))['error']['code'] == -32602
         await ws.close()
     asyncio.run(run())
+
+
+def test_m7_custom_view_filters(srv):
+    # A registered custom view must return exactly the torrents its filter selects
+    # -- the same set as the equivalent built-in view -- not the whole list. This
+    # covers the fake's view.filter handling and, end to end, that rtremote installs
+    # the right condition and filters the registration snapshot by it.
+    async def run():
+        ws, _ = await _connect(srv)
+        wm, m = await _connect(srv, view='main', id=430)
+        main_hashes = sorted(t['hash'] for t in m['result']['torrents'])
+        await wm.close()
+        assert len(main_hashes) >= 2  # fixture seeds alpha (seeding) + bravo (stopped)
+        saw_proper_subset = False
+        # (filter preset, the built-in view that selects the same set). 'downloading'
+        # is a preset but not a built-in view name; its set is the 'incomplete' view.
+        cases = [('seeding', 'seeding'), ('stopped', 'stopped'), ('complete', 'complete'),
+                 ('downloading', 'incomplete'), ('all', 'main')]
+        for i, (preset, builtin) in enumerate(cases):
+            wref, ref = await _connect(srv, view=builtin, id=440 + i)
+            expected = sorted(t['hash'] for t in ref['result']['torrents'])
+            await wref.close()
+            name = 'cv_' + preset
+            assert (await _call(ws, 'add_view', {'name': name, 'filter': preset}, 450 + i))['result']['name'] == name
+            wcv, resp = await _connect(srv, view=name, id=460 + i)
+            got = sorted(t['hash'] for t in resp['result']['torrents'])
+            await wcv.close()
+            assert got == expected, (preset, got, expected)  # custom view filters like the built-in one
+            if 0 < len(got) < len(main_hashes):
+                saw_proper_subset = True
+        # at least one filter returned a non-empty proper subset: proves the view is
+        # actually filtered, not passed through as the whole list (the bug this guards)
+        assert saw_proper_subset
+        await ws.close()
+    asyncio.run(run())
