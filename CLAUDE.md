@@ -76,6 +76,17 @@ The Android app speaks JSON-RPC 2.0 over a single persistent secure WebSocket.
   - A push may occasionally be delivered *before* the register response on
     re-register (both directions are async); the app's merge logic tolerates
     this.
+- **`rtremote_protocol_version`** — integer sent at the top level of the
+  `register` response next to `version` (constant `RTR_PROTOCOL_VERSION` in
+  `server_wss.py`, not substituted at build time). Bumped **only** when the
+  wire contract changes (new method, new field, changed shape). The app treats
+  an absent field as 1 (today's contract) and hides controls whose minimum
+  level the server does not meet. It is not a capability list and not
+  configuration: **rtremote never gates** — it is an intermediary and forwards
+  whatever rtorrent accepts. Monetization (in-app purchases) lives entirely in
+  the app; nothing about entitlements is ever on the wire. Planned levels:
+  2 = global setters, 3 = per-torrent actions, 4 = add torrent / file
+  priorities, 5 = per-torrent tuning and peers.
 - **`get_files` / `get_peers` / `get_trackers`** — request a per-torrent
   detail list, identified by `{"hash": "<info_hash>"}`. The hash must be a
   40-char hex string (it is embedded into an XML-RPC call; anything else is
@@ -215,6 +226,16 @@ broadcasts.
 timeout the client's transport is aborted so one stuck client cannot stall
 the updater or other clients. Failed sends are logged; the client registry is
 cleaned up when the handler's `finally` runs.
+
+### Deprecated rtorrent names still in use (migrate)
+
+rtorrent master keeps `d.multicall2`, `network.open_sockets` and
+`network.max_open_sockets` only as deprecated redirects marked for removal
+(`src/main.cc`). Move to `d.multicall`, `system.sockets.size` and
+`system.sockets.max_size` (keeping the wire field names via the alias maps)
+before adding write support. `network.max_open_files.set` and
+`network.http.max_total_connections.set` are no-op stubs in master: never
+expose them as setters.
 
 ### Versioning
 
