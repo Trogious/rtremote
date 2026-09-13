@@ -12,12 +12,19 @@ Speaks just enough of the XML-RPC dialect for server_wss.py:
 - plain getters and *.set / *.set_kb setters (for update-propagation tests);
   requests carrying UNTRUSTED_CONNECTION=1 are rejected for commands outside
   rtorrent's untrusted-safe allowlist, like the real thing
+- per-torrent actions (d.start/stop/pause/resume/open/close/check_hash/erase),
+  file priority (f.priority.set), tracker enable (t.is_enabled.set) and insert
+  (d.tracker.insert), peer actions (p.banned/snubbed/disconnect via <hash>:p<id>),
+  add torrent (load.start/load.raw_start), named throttle groups
+  (throttle.up/down + throttle.up.max/down.max), custom views (view.*) and
+  scheduling (schedule/schedule.remove) — all recorded so tests can observe them
 - fake.add_torrent / fake.remove_torrent / fake.fail_next_set /
   fake.was_untrusted control methods
 """
 import os
 import socketserver
 import threading
+import urllib.parse
 from xml.etree.ElementTree import fromstring
 from xml.sax.saxutils import escape
 
@@ -27,14 +34,22 @@ from xml.sax.saxutils import escape
 DEPRECATED_COMMANDS = {'d.multicall2', 'network.open_sockets', 'network.max_open_sockets',
                        'network.max_open_sockets.set'}
 
-# setters rtorrent marks rpc.mark_safe (usable on UNTRUSTED_CONNECTION=1
+# commands rtorrent marks rpc.mark_safe (usable on UNTRUSTED_CONNECTION=1
 # requests), per v0.16.22 and master; like the real thing, the fake rejects
 # any other command arriving on an untrusted request - this catches rtremote
 # sending the untrusted header for a command rtorrent does not allow it on
-UNTRUSTED_SAFE_SETTERS = {
+UNTRUSTED_SAFE = {
+    # global rate/slot/peer setters
     'throttle.global_up.max_rate.set_kb', 'throttle.global_down.max_rate.set_kb',
     'throttle.max_uploads.global.set', 'throttle.max_downloads.global.set',
     'throttle.max_uploads.set', 'throttle.max_downloads.set',
+    'throttle.min_peers.normal.set', 'throttle.max_peers.normal.set',
+    'throttle.min_peers.seed.set', 'throttle.max_peers.seed.set',
+    # per-torrent actions rtorrent marks safe (start/stop/announce are NOT here)
+    'd.pause', 'd.resume', 'd.open', 'd.close', 'd.check_hash', 'd.erase',
+    # file / tracker / peer writes rtorrent marks safe
+    'f.priority.set', 't.is_enabled.set',
+    'p.banned.set', 'p.snubbed.set', 'p.disconnect',
 }
 
 
@@ -89,6 +104,10 @@ class State:
             'throttle.max_unchoked_downloads': 2,
             'throttle.max_uploads.global': 0,
             'throttle.max_downloads.global': 0,
+            'throttle.min_peers.normal': 100,
+            'throttle.max_peers.normal': 200,
+            'throttle.min_peers.seed': -1,
+            'throttle.max_peers.seed': -1,
         }
         # keyed by info hash; field names are rtorrent command names
         self.torrents = {}
@@ -99,9 +118,15 @@ class State:
         self.untrusted_methods = set()
         # when set (fake.fail_next_set), the next setter call returns a fault
         self.fail_next_set = False
+        # M6/M7 registries the fake records so behaviour is observable in tests
+        self.throttle_groups = {}  # name -> {'up': bytes, 'down': bytes}
+        self.views = set()
+        self.schedules = {}        # name -> command string
+        self._added_counter = 0
 
     def add_torrent(self, hash, name, size, complete=0, is_open=1, is_active=1,
-                    down_rate=0, up_rate=0, trackers=None, has_active_not_scrape=0):
+                    down_rate=0, up_rate=0, trackers=None, has_active_not_scrape=0,
+                    directory='/home/seed/downloads', files=None):
         with self.lock:
             self.torrents[hash] = {
                 'd.hash': hash, 'd.name': name, 'd.size_bytes': size,
@@ -115,13 +140,45 @@ class State:
                 'd.message': '', 'd.size_chunks': 100,
                 'd.completed_chunks': 100 if complete else 50,
                 'd.tracker.has_active_not_scrape': has_active_not_scrape,
+                # per-torrent tuning + label (M3 reads) and directory (M7 move data)
+                'd.custom1': '', 'd.priority': 2, 'd.uploads_max': 0,
+                'd.downloads_max': 0, 'd.peers_max': 0, 'd.throttle_name': '',
+                'd.directory': directory,
             }
             self.trackers[hash] = trackers or []
             self.peers[hash] = []
-            self.files[hash] = [{
+            self.files[hash] = files if files is not None else [{
                 'f.size_chunks': 100, 'f.completed_chunks': 100 if complete else 50,
                 'f.priority': 1, 'f.size_bytes': size, 'f.path': name,
             }]
+
+    def add_next_torrent(self, payload, raw, start, trailing):
+        # simulate load.start/load.raw_start: synthesize a torrent from the magnet's
+        # dn= (or a placeholder) plus any trailing d.directory.set= / d.custom1.set=
+        with self.lock:
+            self._added_counter += 1
+            n = self._added_counter
+        name = None
+        if not raw and 'magnet:' in str(payload).lower():
+            for k, v in urllib.parse.parse_qsl(urllib.parse.urlparse(payload).query):
+                if k == 'dn':
+                    name = v
+        if not name:
+            name = 'added-%d.iso' % n
+        directory, label = '/home/seed/downloads', ''
+        for cmd in trailing:
+            if isinstance(cmd, str) and cmd.startswith('d.directory.set='):
+                directory = cmd[len('d.directory.set='):]
+            elif isinstance(cmd, str) and cmd.startswith('d.custom1.set='):
+                label = cmd[len('d.custom1.set='):]
+        hash = ('%040X' % (n * 0x1111111111))[:40]
+        self.add_torrent(hash, name, 700 * 1024 * 1024, complete=0,
+                         is_open=1 if start else 0, is_active=1 if start else 0,
+                         directory=directory)
+        if label:
+            with self.lock:
+                self.torrents[hash]['d.custom1'] = label
+        return hash
 
     def view_hashes(self, view):
         with self.lock:
@@ -187,6 +244,31 @@ def _parse_params(params_el):
     return [_parse_value(p.find('value')) for p in params_el.findall('param')]
 
 
+def _split_index(target, type_char):
+    # "<hash>:f3" -> ("<hash>", 3); returns (hash, None) if malformed
+    marker = ':' + type_char
+    hash, sep, idx = target.partition(marker)
+    if not sep:
+        return target, None
+    try:
+        return hash, int(idx)
+    except ValueError:
+        return hash, None
+
+
+def _split_peer(target):
+    hash, sep, pid = target.partition(':p')
+    return (hash, pid) if sep else (target, None)
+
+
+def _new_tracker(group, url):
+    return {'t.group': group, 't.url': url, 't.is_busy': 0, 't.latest_event': 0,
+            't.id': 'ins', 't.failed_counter': 0, 't.success_counter': 0,
+            't.scrape_counter': 0, 't.is_usable': 1, 't.is_enabled': 1,
+            't.scrape_complete': 0, 't.scrape_incomplete': 0, 't.scrape_downloaded': 0,
+            't.latest_new_peers': 0, 't.latest_sum_peers': 0}
+
+
 class Responder:
     def __init__(self, state):
         self.state = state
@@ -220,7 +302,7 @@ class Responder:
         if untrusted:
             with state.lock:
                 state.untrusted_methods.add(method)
-            if method not in UNTRUSTED_SAFE_SETTERS:
+            if method not in UNTRUSTED_SAFE:
                 # message shape matches rtorrent's untrusted_error
                 return _fault(-501, 'Command "%s" is not allowed for untrusted connections.' % method)
 
@@ -271,6 +353,115 @@ class Responder:
         if method == 'fake.was_untrusted':
             with state.lock:
                 return _response(self.value(1 if params[0] in state.untrusted_methods else 0))
+
+        # ---- per-torrent actions (M1): target = info hash ----
+        if method in ('d.start', 'd.open', 'd.resume', 'd.stop', 'd.close',
+                      'd.pause', 'd.check_hash', 'd.tracker_announce', 'd.erase'):
+            hash = params[0] if params else ''
+            with state.lock:
+                if hash not in state.torrents:
+                    return _fault(-501, 'Could not find info-hash.')
+                t = state.torrents[hash]
+                if method in ('d.start', 'd.open', 'd.resume'):
+                    t['d.is_open'], t['d.is_active'] = 1, 1
+                elif method in ('d.stop', 'd.close'):
+                    t['d.is_open'], t['d.is_active'] = 0, 0
+                elif method == 'd.pause':
+                    t['d.is_active'] = 0
+                elif method == 'd.check_hash':
+                    t['d.is_hash_checking'] = 1
+                elif method == 'd.erase':
+                    state.torrents.pop(hash, None)
+                    state.files.pop(hash, None)
+                    state.trackers.pop(hash, None)
+                    state.peers.pop(hash, None)
+            return _response(self.value(0))
+
+        # ---- file priority (M2): target = <hash>:f<index> ----
+        if method == 'f.priority.set':
+            hash, idx = _split_index(params[0], 'f')
+            with state.lock:
+                files = state.files.get(hash)
+                if files is None or idx is None or idx >= len(files):
+                    return _fault(-501, 'invalid file target.')
+                files[idx]['f.priority'] = params[1]
+            return _response(self.value(params[1]))
+
+        # ---- tracker enable (M2): target = <hash>:t<index> ----
+        if method == 't.is_enabled.set':
+            hash, idx = _split_index(params[0], 't')
+            with state.lock:
+                trackers = state.trackers.get(hash)
+                if trackers is None or idx is None or idx >= len(trackers):
+                    return _fault(-501, 'invalid tracker target.')
+                trackers[idx]['t.is_enabled'] = params[1]
+            return _response(self.value(params[1]))
+
+        # ---- peer actions (M3): target = <hash>:p<40-hex peer id> ----
+        if method in ('p.banned.set', 'p.snubbed.set', 'p.disconnect'):
+            hash, peer_id = _split_peer(params[0])
+            with state.lock:
+                peers = state.peers.get(hash)
+                if peers is None or peer_id is None:
+                    return _fault(-501, 'invalid peer target.')
+                peer = next((p for p in peers if p.get('p.id') == peer_id), None)
+                if peer is None:
+                    return _fault(-501, 'peer not found.')
+                if method == 'p.disconnect':
+                    peers.remove(peer)
+                elif method == 'p.banned.set':
+                    peer['p.banned'] = params[1]
+                else:
+                    peer['p.snubbed'] = params[1]
+            return _response(self.value(0))
+
+        # ---- add torrent (M2/M5): load.* target '' then URI/raw + trailing cmds ----
+        if method.startswith('load.'):
+            raw = 'raw' in method
+            start = 'start' in method
+            payload = params[1] if len(params) > 1 else ''
+            trailing = params[2:]
+            state.add_next_torrent(payload, raw, start, trailing)
+            return _response(self.value(0))
+
+        # ---- add tracker (M5): d.tracker.insert(hash, group, url) ----
+        if method == 'd.tracker.insert':
+            hash = params[0]
+            url = params[-1]
+            with state.lock:
+                if hash not in state.trackers:
+                    return _fault(-501, 'Could not find info-hash.')
+                state.trackers[hash].append(_new_tracker(int(params[1]), url))
+                state.torrents[hash]['d.tracker_size'] = len(state.trackers[hash])
+            return _response(self.value(0))
+
+        # ---- named throttle groups (M6) ----
+        if method in ('throttle.up', 'throttle.down'):
+            name, rate_kb = params[1], params[2]
+            with state.lock:
+                grp = state.throttle_groups.setdefault(name, {'up': 0, 'down': 0})
+                grp['up' if method == 'throttle.up' else 'down'] = rate_kb * 1024
+            return _response(self.value(0))
+        if method in ('throttle.up.max', 'throttle.down.max'):
+            # CMD2_ANY_STRING: the group name is the target (first) param
+            name = params[0] if params else ''
+            with state.lock:
+                grp = state.throttle_groups.get(name)
+            key = 'up' if method == 'throttle.up.max' else 'down'
+            return _response(self.value(grp[key] if grp else -1))
+
+        # ---- custom views (M7) and scheduling (M6): accept and record ----
+        if method in ('view.add', 'view.filter', 'view.filter_on', 'view.sort_new'):
+            with state.lock:
+                state.views.add(params[1] if method != 'view.add' else params[1])
+            return _response(self.value(0))
+        if method in ('schedule', 'schedule.remove', 'schedule.if_absent'):
+            with state.lock:
+                if method == 'schedule.remove':
+                    state.schedules.pop(params[1] if len(params) > 1 else '', None)
+                else:
+                    state.schedules[params[1]] = params[4] if len(params) > 4 else ''
+            return _response(self.value(0))
 
         if method.endswith('.set_kb'):
             # rate setters take KB and store bytes (CMD2_ANY_VALUE_KB)

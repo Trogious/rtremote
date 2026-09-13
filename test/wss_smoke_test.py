@@ -13,6 +13,7 @@ import asyncio
 import hashlib
 import json
 import os
+import shutil
 import signal
 import socket
 import ssl
@@ -70,7 +71,7 @@ def _free_port():
     return port
 
 
-def _spawn_server(interval):
+def _spawn_server(interval, extra_env=None):
     tmp = tempfile.mkdtemp(prefix='rtr_smoke_')
     server = Server(tmp)
     server.fake.start()
@@ -91,6 +92,8 @@ def _spawn_server(interval):
         'RTR_PLUGINS_DISK_USAGE_PATHS': os.path.join(tmp, 'nonexistent'),
         'PYTHONPATH': REPO,
     })
+    if extra_env:
+        env.update(extra_env)
     proc = subprocess.Popen([sys.executable, os.path.join(REPO, 'server_wss.py')], env=env, cwd=REPO)
     proc.wait()  # the daemon detaches; the launcher exits immediately
     deadline = time.time() + 15
@@ -143,6 +146,18 @@ def srv_slow():
     server = _spawn_server(SLOW_INTERVAL)
     yield server
     _stop_server(server)
+
+
+@pytest.fixture(scope='module')
+def srv_data():
+    # a server with RTR_DATA_ROOT set, so erase-with-data and move-data are enabled;
+    # the fake and this test share the filesystem, so the fs ops are observable
+    data_root = tempfile.mkdtemp(prefix='rtr_data_')
+    server = _spawn_server(INTERVAL, {'RTR_DATA_ROOT': data_root})
+    server.data_root = data_root
+    yield server
+    _stop_server(server)
+    shutil.rmtree(data_root, ignore_errors=True)
 
 
 def _read_log(server):
@@ -208,7 +223,7 @@ def test_register_main(srv):
         result = response['result']
         assert response['id'] == 7
         assert 'version' in result
-        assert result['rtremote_protocol_version'] == 2
+        assert result['rtremote_protocol_version'] == 8
         assert result['global']['throttle_global_down_max_rate'] == 1024
         assert result['global']['network_http_max_open'] == 32
         assert result['global']['system_api_version'] == 26
@@ -556,5 +571,243 @@ def test_set_global_pushes_immediately(srv_slow):
             ws, 95, lambda f: f.get('result', {}).get('global', {}).get('throttle_max_downloads') == 9,
             timeout=PUSH_TIMEOUT)
         assert response['result'] == {'key': 'throttle_max_downloads', 'value': 9}
+        await ws.close()
+    asyncio.run(run())
+
+
+# ---- M1-M7 write methods -------------------------------------------------
+
+async def _await_id(ws, req_id, timeout=5):
+    # a write response and unrelated pushes race on the socket; return the frame
+    # whose id matches the request
+    end = asyncio.get_running_loop().time() + timeout
+    while True:
+        left = end - asyncio.get_running_loop().time()
+        assert left > 0, 'no response for id %s' % req_id
+        frame = json.loads(await asyncio.wait_for(ws.recv(), left))
+        if frame.get('id') == req_id:
+            return frame
+
+
+async def _call(ws, method, params, id):
+    await ws.send(_req(method, params, id=id))
+    return await _await_id(ws, id)
+
+
+def _add(srv, hash, **kw):
+    kw.setdefault('is_open', 1)
+    kw.setdefault('is_active', 1)
+    srv.state.add_torrent(hash, kw.pop('name', 'demo.iso'), kw.pop('size', 1000000), **kw)
+
+
+def test_m1_torrent_actions(srv):
+    h = '1' * 40
+    _add(srv, h, name='m1.iso', is_open=1, is_active=1)
+    async def run():
+        ws, _ = await _connect(srv)
+        r = await _call(ws, 'torrent_action', {'hash': h, 'action': 'stop'}, 201)
+        assert r['result'] == {'hash': h, 'action': 'stop'}
+        assert srv.state.torrents[h]['d.is_open'] == 0
+        assert await _call(ws, 'torrent_action', {'hash': h, 'action': 'start'}, 202)
+        assert srv.state.torrents[h]['d.is_open'] == 1
+        await _call(ws, 'torrent_action', {'hash': h, 'action': 'pause'}, 203)
+        assert srv.state.torrents[h]['d.is_active'] == 0
+        r = await _call(ws, 'set_priority', {'hash': h, 'priority': 3}, 204)
+        assert srv.state.torrents[h]['d.priority'] == 3
+        # start/stop are not untrusted-safe; pause is
+        assert not _was_untrusted(srv, 'd.stop')
+        assert _was_untrusted(srv, 'd.pause')
+        # rejections
+        assert (await _call(ws, 'torrent_action', {'hash': 'zz', 'action': 'stop'}, 205))['error']['code'] == -32602
+        assert (await _call(ws, 'torrent_action', {'hash': h, 'action': 'bogus'}, 206))['error']['code'] == -32602
+        assert (await _call(ws, 'set_priority', {'hash': h, 'priority': 9}, 207))['error']['code'] == -32602
+        await ws.close()
+    asyncio.run(run())
+    srv.state.torrents.pop(h, None)
+
+
+def test_m2_file_priority_and_tracker(srv):
+    async def run():
+        ws, _ = await _connect(srv)
+        r = await _call(ws, 'set_file_priority', {'hash': HASH_A, 'file_index': 0, 'priority': 0}, 210)
+        assert r['result']['priority'] == 0
+        assert srv.state.files[HASH_A][0]['f.priority'] == 0
+        assert _was_untrusted(srv, 'f.priority.set')
+        await _call(ws, 'set_file_priority', {'hash': HASH_A, 'file_index': 0, 'priority': 1}, 211)
+        r = await _call(ws, 'set_tracker_enabled', {'hash': HASH_A, 'tracker_index': 0, 'enabled': 0}, 212)
+        assert r['result']['enabled'] == 0
+        assert srv.state.trackers[HASH_A][0]['t.is_enabled'] == 0
+        assert _was_untrusted(srv, 't.is_enabled.set')
+        await _call(ws, 'set_tracker_enabled', {'hash': HASH_A, 'tracker_index': 0, 'enabled': 1}, 213)
+        # rejections
+        assert (await _call(ws, 'set_file_priority', {'hash': HASH_A, 'file_index': 0, 'priority': 3}, 214))['error']['code'] == -32602
+        assert (await _call(ws, 'set_file_priority', {'hash': HASH_A, 'file_index': -1, 'priority': 1}, 215))['error']['code'] == -32602
+        await ws.close()
+    asyncio.run(run())
+
+
+def test_m2_add_torrent(srv):
+    async def run():
+        ws, _ = await _connect(srv)
+        magnet = 'magnet:?xt=urn:btih:%s&dn=AddedDistro.iso' % ('C' * 40)
+        r = await _call(ws, 'add_torrent', {'magnet': magnet, 'start': True, 'label': 'iso'}, 220)
+        assert r['result'] == {'added': True}
+        added = [h for h, t in srv.state.torrents.items() if t['d.name'] == 'AddedDistro.iso']
+        assert len(added) == 1
+        assert srv.state.torrents[added[0]]['d.custom1'] == 'iso'
+        # rejections: neither magnet nor content, and a bad magnet
+        assert (await _call(ws, 'add_torrent', {'start': True}, 221))['error']['code'] == -32602
+        assert (await _call(ws, 'add_torrent', {'magnet': 'http://x', 'start': True}, 222))['error']['code'] == -32602
+        srv.state.torrents.pop(added[0], None)
+        await ws.close()
+    asyncio.run(run())
+
+
+def test_m3_tuning_and_label(srv):
+    async def run():
+        ws, _ = await _connect(srv)
+        assert (await _call(ws, 'set_torrent_limit', {'hash': HASH_A, 'key': 'uploads_max', 'value': 5}, 230))['result']['value'] == 5
+        assert srv.state.torrents[HASH_A]['d.uploads_max'] == 5
+        assert (await _call(ws, 'set_label', {'hash': HASH_A, 'label': 'linux-isos'}, 231))['result']['label'] == 'linux-isos'
+        assert srv.state.torrents[HASH_A]['d.custom1'] == 'linux-isos'
+        # throttle name requires an existing group
+        assert (await _call(ws, 'set_throttle_name', {'hash': HASH_A, 'name': 'nope'}, 232))['error']['code'] == -32602
+        await _call(ws, 'throttle_group', {'name': 'night', 'up_kb': 500, 'down_kb': 0}, 233)
+        assert (await _call(ws, 'set_throttle_name', {'hash': HASH_A, 'name': 'night'}, 234))['result']['name'] == 'night'
+        assert srv.state.torrents[HASH_A]['d.throttle_name'] == 'night'
+        # detach
+        await _call(ws, 'set_throttle_name', {'hash': HASH_A, 'name': ''}, 235)
+        # restore
+        await _call(ws, 'set_torrent_limit', {'hash': HASH_A, 'key': 'uploads_max', 'value': 0}, 236)
+        await _call(ws, 'set_label', {'hash': HASH_A, 'label': ''}, 237)
+        await ws.close()
+    asyncio.run(run())
+
+
+def test_m3_peer_actions(srv):
+    peer = {'p.id': 'D' * 40, 'p.address': '192.0.2.5', 'p.up_rate': 0, 'p.down_rate': 0,
+            'p.peer_rate': 0, 'p.is_preferred': 0, 'p.is_encrypted': 1, 'p.is_incoming': 0,
+            'p.completed_percent': 42, 'p.client_version': 'rakshasa 0.16'}
+    srv.state.peers[HASH_A].append(peer)
+    async def run():
+        ws, _ = await _connect(srv)
+        assert (await _call(ws, 'peer_action', {'hash': HASH_A, 'peer': 'D' * 40, 'peer_action': 'ban'}, 240))['result']['peer_action'] == 'ban'
+        assert srv.state.peers[HASH_A][0]['p.banned'] == 1
+        assert _was_untrusted(srv, 'p.banned.set')
+        assert (await _call(ws, 'peer_action', {'hash': HASH_A, 'peer': 'D' * 40, 'peer_action': 'disconnect'}, 241))
+        assert srv.state.peers[HASH_A] == []
+        # rejections
+        assert (await _call(ws, 'peer_action', {'hash': HASH_A, 'peer': 'short', 'peer_action': 'ban'}, 242))['error']['code'] == -32602
+        await ws.close()
+    asyncio.run(run())
+
+
+def test_m3_global_peer_limits(srv):
+    async def run():
+        ws, _ = await _connect(srv)
+        r = await _call(ws, 'set_global', {'key': 'throttle_max_peers_normal', 'value': 300}, 250)
+        assert r['result']['value'] == 300
+        assert srv.state.globals['throttle.max_peers.normal'] == 300
+        assert _was_untrusted(srv, 'throttle.max_peers.normal.set')
+        srv.rpc().call('throttle.max_peers.normal.set', [('string', ''), ('i8', 200)])
+        await ws.close()
+    asyncio.run(run())
+
+
+def test_m6_throttle_groups(srv):
+    async def run():
+        ws, _ = await _connect(srv)
+        r = await _call(ws, 'throttle_group', {'name': 'day', 'up_kb': 1000, 'down_kb': 2000}, 260)
+        assert r['result'] == {'name': 'day', 'up_kb': 1000, 'down_kb': 2000}
+        assert srv.state.throttle_groups['day'] == {'up': 1000 * 1024, 'down': 2000 * 1024}
+        # register surfaces the group
+        ws2, resp = await _connect(srv, id=261)
+        names = [g['name'] for g in resp['result'].get('throttle_groups', [])]
+        assert 'day' in names
+        await ws2.close()
+        assert (await _call(ws, 'throttle_group', {'name': 'bad name!', 'up_kb': 1}, 262))['error']['code'] == -32602
+        await ws.close()
+    asyncio.run(run())
+
+
+def test_m6_schedule(srv):
+    async def run():
+        ws, _ = await _connect(srv)
+        r = await _call(ws, 'set_schedule', {'up_day': 4096, 'down_day': 10240, 'up_night': 0,
+                                             'down_night': 0, 'day_hhmm': '09:00', 'night_hhmm': '23:30'}, 270)
+        assert r['result']['up_day'] == 4096
+        assert 'rtr_day_up' in srv.state.schedules
+        assert 'rtr_night_down' in srv.state.schedules
+        assert (await _call(ws, 'set_schedule', {'up_day': 1, 'down_day': 1, 'up_night': 1,
+                                                 'down_night': 1, 'day_hhmm': '9am', 'night_hhmm': '23:30'}, 271))['error']['code'] == -32602
+        await _call(ws, 'clear_schedule', {}, 272)
+        assert srv.state.schedules == {}
+        await ws.close()
+    asyncio.run(run())
+
+
+def test_m7_add_view(srv):
+    async def run():
+        ws, _ = await _connect(srv)
+        r = await _call(ws, 'add_view', {'name': 'linuxonly', 'filter': 'seeding'}, 280)
+        assert r['result'] == {'name': 'linuxonly', 'filter': 'seeding'}
+        assert 'linuxonly' in srv.state.views
+        # the new view is now registrable and reported in the register snapshot
+        ws2, resp = await _connect(srv, view='linuxonly', id=281)
+        assert 'linuxonly' in [v['name'] for v in resp['result'].get('views', [])]
+        await ws2.close()
+        assert (await _call(ws, 'add_view', {'name': 'main', 'filter': 'all'}, 282))['error']['code'] == -32602
+        assert (await _call(ws, 'add_view', {'name': 'x', 'filter': 'evil'}, 283))['error']['code'] == -32602
+        await ws.close()
+    asyncio.run(run())
+
+
+def test_m5_erase_with_data(srv_data):
+    h = 'E' * 40
+    tdir = os.path.join(srv_data.data_root, 'erase-me')
+    os.makedirs(tdir, exist_ok=True)
+    with open(os.path.join(tdir, 'payload.bin'), 'wb') as f:
+        f.write(b'x' * 16)
+    srv_data.state.add_torrent(h, 'erase-me', 16, directory=tdir,
+                               files=[{'f.size_chunks': 1, 'f.completed_chunks': 1, 'f.priority': 1,
+                                       'f.size_bytes': 16, 'f.path': 'payload.bin'}])
+    async def run():
+        ws, _ = await _connect(srv_data)
+        r = await _call(ws, 'erase_torrent', {'hash': h, 'with_data': True}, 290)
+        assert r['result'] == {'hash': h, 'with_data': True}
+        await ws.close()
+    asyncio.run(run())
+    assert not os.path.exists(os.path.join(tdir, 'payload.bin'))
+    assert h not in srv_data.state.torrents
+
+
+def test_m7_move_data(srv_data):
+    h = 'F' * 40
+    src = os.path.join(srv_data.data_root, 'show')
+    os.makedirs(src, exist_ok=True)
+    with open(os.path.join(src, 'ep1.mkv'), 'wb') as f:
+        f.write(b'y' * 16)
+    dst_parent = os.path.join(srv_data.data_root, 'archive')
+    srv_data.state.add_torrent(h, 'show', 16, directory=src,
+                               files=[{'f.size_chunks': 1, 'f.completed_chunks': 1, 'f.priority': 1,
+                                       'f.size_bytes': 16, 'f.path': 'ep1.mkv'}])
+    async def run():
+        ws, _ = await _connect(srv_data)
+        r = await _call(ws, 'move_data', {'hash': h, 'directory': dst_parent}, 300)
+        assert r['result']['directory'] == os.path.join(dst_parent, 'show')
+        await ws.close()
+    asyncio.run(run())
+    assert os.path.exists(os.path.join(dst_parent, 'show', 'ep1.mkv'))
+    assert not os.path.exists(os.path.join(src, 'ep1.mkv'))
+    assert srv_data.state.torrents[h]['d.directory'] == os.path.join(dst_parent, 'show')
+
+
+def test_move_data_disabled_without_root(srv):
+    # the default server has no RTR_DATA_ROOT, so data ops are refused (-32603)
+    h = 'A' * 40
+    async def run():
+        ws, _ = await _connect(srv)
+        r = await _call(ws, 'move_data', {'hash': h, 'directory': '/tmp/whatever'}, 310)
+        assert r['error']['code'] == -32603
         await ws.close()
     asyncio.run(run())

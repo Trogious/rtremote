@@ -84,39 +84,61 @@ The Android app speaks JSON-RPC 2.0 over a single persistent secure WebSocket.
   level the server does not meet. It is not a capability list and not
   configuration: **rtremote never gates** — it is an intermediary and forwards
   whatever rtorrent accepts. Monetization (in-app purchases) lives entirely in
-  the app; nothing about entitlements is ever on the wire. Levels: 1 = the
-  original read-only contract, 2 (current) = `set_global` plus the
-  `throttle_max_uploads_global` / `throttle_max_downloads_global` fields.
-  Planned: 3 = per-torrent actions, 4 = add torrent / file
-  priorities, 5 = per-torrent tuning and peers, 6 = erase with data, add
-  tracker, add-torrent `directory` / `label` options, 7 = scheduled caps
-  (rtremote-owned, fixed-name `schedule` entries built only from validated
-  numbers) and named throttle groups, 8 = custom views and move data (the
-  only feature that makes rtremote touch user files; restricted to a
-  configured root).
+  the app; nothing about entitlements is ever on the wire. Levels (current =
+  8): 1 = the original read-only contract; 2 = `set_global` plus the
+  `throttle_max_uploads_global` / `throttle_max_downloads_global` fields;
+  3 = per-torrent actions (`torrent_action`, `set_priority`); 4 = add torrent
+  (`add_torrent`), file priority (`set_file_priority`), tracker enable
+  (`set_tracker_enabled`) — the free details screen reads `get_files/peers/
+  trackers`, which have existed since level 1; 5 = per-torrent tuning
+  (`set_torrent_limit`, `set_throttle_name`, `set_label`), peer actions
+  (`peer_action`) and the four global peer-limit `set_global` keys; 6 =
+  erase-with-data (`erase_torrent {with_data}`), `add_tracker`, and
+  `add_torrent`'s `directory` / `label` options; 7 = scheduled caps
+  (`set_schedule` / `clear_schedule`, rtremote-owned fixed-name `schedule`
+  entries built only from validated numbers) and named throttle groups
+  (`throttle_group`); 8 = custom views (`add_view`) and move data
+  (`move_data`, the only feature besides erase-with-data that makes rtremote
+  touch user files; both are confined to `RTR_DATA_ROOT`).
 - **`get_files` / `get_peers` / `get_trackers`** — request a per-torrent
   detail list, identified by `{"hash": "<info_hash>"}`. The hash must be a
   40-char hex string (it is embedded into an XML-RPC call; anything else is
   rejected with a JSON-RPC error). Results are served from a short TTL cache
   (`RTR_SHORT_CACHE_TTL`, default 5 s) so multiple clients hitting the same
   torrent don't hammer rtorrent.
-- **`set_global`** — the only write method (protocol level 2). Params are
-  `{"key": <wire field>, "value": <int>}`; the key must be one of the eight
-  entries in `Remote.GLOBAL_SETTERS` (`throttle_global_up_max_rate`,
-  `throttle_global_down_max_rate` — the value is KB for these two, mapped to
-  `throttle.global_*.max_rate.set_kb` — `throttle_max_uploads_global`,
-  `throttle_max_downloads_global`, `throttle_max_uploads`,
-  `throttle_max_downloads`, `network_max_open_sockets`,
-  `network_listen_port`) and the value an integer inside the entry's
-  [min, max] range (>= 0; listen port 1..65535). Any other key, a
-  non-integer (including booleans) or an out-of-range value is rejected with
-  `-32602` before any rtorrent command is built; an rtorrent fault surfaces
-  as `-32603`. On success the updater ticks immediately
-  (`Cached.update_now`), so the change reaches every client as a normal
-  global diff without waiting for `RTR_RETR_INTERVAL`. The dispatch in
-  `process_request` routes a registered client's params dict containing
-  `"key"` to this handler, exactly as `"hash"` routes to the detail methods;
-  unregistered sockets are dropped as for every other method.
+- **Write methods** — a registered client's request is dispatched by **method
+  name** (`WRITE_HANDLERS` in `server_wss.py`); an unknown method returns
+  `-32601` and the connection stays usable, an unregistered socket is dropped.
+  Every handler validates its params server-side (hash = 40-hex, integers
+  range-checked, enums allowlisted, magnet/URL/path/label patterns), maps the
+  wire key to the rtorrent command, and builds the command string itself — no
+  client-supplied command text is ever forwarded. On success the updater ticks
+  immediately (`Cached.update_now`) so the change reaches every client as a
+  normal diff without waiting for `RTR_RETR_INTERVAL`. An rtorrent fault
+  becomes `-32603`. The methods:
+  - `set_global {key, value}` (level 2, extended at level 5 with the four
+    peer-limit keys) — `Remote.GLOBAL_SETTERS` allowlist; the two rate keys
+    take KB (`set_kb`).
+  - `torrent_action {hash, action}` and `set_priority {hash, priority 0..3}`
+    (level 3).
+  - `add_torrent {magnet | content_b64, start, [directory], [label]}`,
+    `set_file_priority {hash, file_index, priority 0..2}`,
+    `set_tracker_enabled {hash, tracker_index, enabled}` (level 4).
+  - `set_torrent_limit {hash, key, value}` (uploads/downloads/peers max),
+    `set_throttle_name {hash, name}` (name must be a group rtremote created),
+    `set_label {hash, label}`, `peer_action {hash, peer, peer_action}` (level 5).
+  - `erase_torrent {hash, with_data}`, `add_tracker {hash, tracker_url}` (level 6).
+  - `throttle_group {name, up_kb, down_kb}`, `set_schedule {up/down_day,
+    up/down_night, day_hhmm, night_hhmm}`, `clear_schedule {}` (level 7).
+  - `add_view {name, filter}` (filter is a safe preset rtremote maps to an
+    rtorrent expression), `move_data {hash, directory}` (level 8).
+  - Write calls carry rtorrent's `UNTRUSTED_CONNECTION=1` header only for
+    commands on rtorrent's own `mark_safe` list (per-command flags in
+    `Remote.TORRENT_ACTIONS` / `GLOBAL_SETTERS` and the file/tracker/peer
+    setters); `d.start`/`d.stop`/`d.tracker_announce`, the per-torrent limit
+    setters, `d.priority.set`, `d.throttle_name.set`, `d.custom1.set`,
+    `d.directory.set`, `load.*`, `d.tracker.insert`, `throttle.*`, `schedule`
+    and `view.*` are **not** safe and go out trusted.
 
 Error handling, by client state:
 - **Unauthenticated** sockets get no feedback: invalid JSON, malformed
@@ -309,6 +331,7 @@ All read at startup; `start.sh` is the canonical place to set them.
 | `RTR_PID_PATH`                    | `./wss_server.pid`                     | PID file written after daemonize.                  |
 | `RTR_LOG_PATH`                    | `./rtr_wss_server.log`                 | Rotating log file (4 × 200 KiB).                   |
 | `RTR_PLUGINS_DISK_USAGE_PATHS`    | `/`                                    | Colon-separated paths for the disk-usage plugin.   |
+| `RTR_DATA_ROOT`                   | `` (empty)                             | Root that erase-with-data / move-data are confined to; empty disables both. |
 
 CLI flags: `-f` / `--foreground` — do not daemonize.
 
@@ -325,16 +348,21 @@ CLI flags: `-f` / `--foreground` — do not daemonize.
   `hmac.compare_digest`. SHA1 here is a **wire-protocol constant** — changing
   the algorithm breaks every existing client/config pair, so improvements
   must be coordinated with the app.
-- Writes exist since protocol level 2, but only through `set_global` and
-  only for the eight global keys in the `Remote.GLOBAL_SETTERS` allowlist.
-  The allowlist rule is binding for every write method, present and future:
-  every request is typed and validated server-side (hashes, integers, per-key
-  ranges, magnet / http URIs, labels, paths under a configured root),
-  rtremote maps the wire key to the rtorrent command and builds every
-  command string itself, and no client-supplied command text is ever
-  forwarded (`execute.*`, `system.shutdown.*`, `session.path.set` and raw
-  `schedule` strings stay unreachable). Reads still forward nothing but a
-  strictly validated 40-hex info hash (and even that is XML-escaped).
+- Writes span protocol levels 2-8 (`WRITE_HANDLERS`), but the allowlist rule
+  is binding for every one of them: every request is typed and validated
+  server-side (40-hex hashes and peer ids, range-checked integers, allowlisted
+  action/limit/preset enums, magnet / http-udp URI / path / label patterns),
+  rtremote maps the wire key to the rtorrent command and builds every command
+  string itself, and no client-supplied command text is ever forwarded
+  (`execute.*`, `system.shutdown.*`, `session.path.set` and raw `schedule` /
+  `view.filter` strings stay unreachable — custom-view filters come only from
+  a fixed `VIEW_FILTER_PRESETS` map, and scheduled-cap commands are built from
+  validated numbers). Reads still forward nothing but a strictly validated
+  40-hex info hash (and even that is XML-escaped).
+- The only features that make rtremote touch user files are erase-with-data
+  and move-data; both are confined to `RTR_DATA_ROOT` by a realpath check
+  (`Remote._require_under`) and are disabled (return `-32603`) when it is
+  unset. rtremote never deletes or moves a path outside that root.
 - Write calls carry rtorrent's `UNTRUSTED_CONNECTION=1` SCGI header where
   rtorrent's own untrusted-safe allowlist (`rpc.mark_safe`) covers the
   command, so rtorrent enforces a second allowlist as defence in depth.

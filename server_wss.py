@@ -1,4 +1,6 @@
 import asyncio
+import base64
+import binascii
 import hmac
 import json
 import os
@@ -15,7 +17,7 @@ from websockets.exceptions import WebSocketException
 from diffs import map_diff, map_get_multi_diff
 from model import Client
 from plugins import DiskUsage
-from remote import Remote
+from remote import MAGNET_RE, SAFE_GROUP_RE, SAFE_PATH_RE, URI_RE, Remote
 from rpc import RpcError
 from utils import Logger, get_sha1, getenv_path
 
@@ -34,8 +36,18 @@ logger = Logger.get_logger()
 RTR_VERSION = '__RTR_VERSION_PLACEHOLDER__'
 # wire-contract level for the Android app's feature gating; bump only when the
 # protocol changes (new method, new field, changed shape) - never at release time.
-# 2 = set_global + throttle.max_uploads/downloads.global in the global data
-RTR_PROTOCOL_VERSION = 2
+# 1=reads 2=set_global(M0) 3=per-torrent actions(M1) 4=details/add/file-prio(M2)
+# 5=tuning/peers(M3) 6=erase-with-data/add-tracker/add-torrent opts(M5)
+# 7=scheduled caps + throttle groups(M6) 8=custom views + move data(M7)
+RTR_PROTOCOL_VERSION = 8
+# root that erase-with-data and move-data are confined to (realpath-checked);
+# empty disables both features (they return a JSON-RPC error)
+RTR_DATA_ROOT = os.getenv('RTR_DATA_ROOT', '')
+# fixed schedule entry names rtremote owns for the day/night cap pair
+SCHEDULE_DAY_UP = 'rtr_day_up'
+SCHEDULE_DAY_DOWN = 'rtr_day_down'
+SCHEDULE_NIGHT_UP = 'rtr_night_up'
+SCHEDULE_NIGHT_DOWN = 'rtr_night_down'
 INFO_HASH_RE = re.compile('[0-9A-Fa-f]{40}')
 
 JSONRPC_METHOD_NOT_FOUND = -32601
@@ -55,6 +67,10 @@ class Cached:
     clients = set()
     clients_lock = None
     update_now = None  # set after a successful write to trigger an immediate updater tick
+    # rtorrent cannot enumerate named throttle groups or custom views, so rtremote
+    # remembers the ones it created (in-memory; reset on restart, like rtorrent's own)
+    throttle_groups = {}  # name -> (up_kb, down_kb)
+    custom_views = {}     # name -> filter preset
     SHORT_CACHES_NO = 4
     SHORT_CACHES = [TTLCache(maxsize=4096, ttl=RTR_SHORT_CACHE_TTL) for _ in range(SHORT_CACHES_NO)]
     SHORT_LOCKS = [RLock() for _ in range(SHORT_CACHES_NO)]
@@ -286,14 +302,24 @@ async def process_request(request, websocket):
     if not isinstance(req, dict) or req.get('jsonrpc') != '2.0' or 'method' not in req or 'id' not in req:
         logger.info('malformed request from %s' % str(websocket.remote_address))
         return None, False
-    params = req.get('params')
+    method = req['method']
+    params = req.get('params') if isinstance(req.get('params'), dict) else {}
     if await Cached.is_registered(websocket):
-        if isinstance(params, dict) and 'hash' in params:
-            response_json = await handle_method_with_hash(req['id'], req['method'], params['hash'])
+        # re-register switches the client's view and returns a fresh snapshot
+        if method == 'register':
+            response_json = await handle_register(req, websocket)
+            if response_json is None:
+                return None, False
             return prepare_response(response_json), True
-        if isinstance(params, dict) and 'key' in params:
-            response_json = await handle_set_global(req['id'], req['method'], params)
-            return prepare_response(response_json), True
+        handler = WRITE_HANDLERS.get(method)
+        if handler is not None:
+            return prepare_response(await handler(req['id'], params)), True
+        if method in READ_HASH_METHODS:
+            return prepare_response(await handle_method_with_hash(req['id'], method, params.get('hash'))), True
+        # registered client, unknown method: JSON-RPC error, connection stays usable
+        return prepare_response(get_json_error(req['id'], JSONRPC_METHOD_NOT_FOUND,
+                                               'unknown method: %s' % method)), True
+    # unregistered: only a successful register keeps the socket (no auth oracle)
     response_json = await handle_register(req, websocket)
     if response_json is None:
         return None, False
@@ -327,6 +353,11 @@ async def handle_register(req, websocket):
             plugins_data[plugin.name()] = plugin_output
     if plugins_data:
         result['plugins'] = plugins_data
+    if Cached.throttle_groups:
+        result['throttle_groups'] = [{'name': n, 'up_kb': u, 'down_kb': d}
+                                     for n, (u, d) in Cached.throttle_groups.items()]
+    if Cached.custom_views:
+        result['views'] = [{'name': n, 'filter': f} for n, f in Cached.custom_views.items()]
     result = await Cached.filter_by_view(result, view_name)
     return get_json_response(req['id'], result)
 
@@ -354,33 +385,336 @@ async def handle_method_with_hash(req_id, method, hash):
     return get_json_response(req_id, {result_key: [x.__dict__ for x in data]})
 
 
-async def handle_set_global(req_id, method, params):
-    # the only write method (protocol level 2). Everything is validated against
-    # the server-side allowlist before any rtorrent command is built; clients
-    # never supply command text
-    if method != 'set_global':
-        return get_json_error(req_id, JSONRPC_METHOD_NOT_FOUND, 'unknown method: %s' % method)
+def _err(req_id, code, message):
+    return get_json_error(req_id, code, message)
+
+
+def _invalid(req_id, message='invalid params'):
+    return get_json_error(req_id, JSONRPC_INVALID_PARAMS, message)
+
+
+def _valid_hash(hash):
+    return isinstance(hash, str) and INFO_HASH_RE.fullmatch(hash)
+
+
+def _valid_int(value, min_value=0, max_value=Remote.XMLRPC_I8_MAX):
+    # bool is an int subclass in Python; a JSON true/false must never pass as 1/0
+    return not isinstance(value, bool) and isinstance(value, int) and min_value <= value <= max_value
+
+
+async def _run_write(req_id, label, func, *args):
+    # run a validated rtorrent write off the event loop, map faults to JSON-RPC,
+    # and trigger an immediate updater tick so the change is pushed at once
+    try:
+        result = await asyncio.to_thread(func, *args)
+    except RpcError as e:
+        logger.info('%s failed: %s' % (label, e))
+        return get_json_error(req_id, JSONRPC_INTERNAL_ERROR, str(e)), False
+    except Exception as e:
+        logger.error('%s failed' % label, exc_info=e)
+        return get_json_error(req_id, JSONRPC_INTERNAL_ERROR, 'internal error'), False
+    logger.info(label)
+    Cached.update_now.set()
+    return result, True
+
+
+async def handle_set_global(req_id, params):
+    # M0 (level 2), extended with the M3 global peer-limit keys. Everything is
+    # validated against the GLOBAL_SETTERS allowlist before any command is built.
     key = params.get('key')
     setter = Remote.GLOBAL_SETTERS.get(key) if isinstance(key, str) else None
     if setter is None:
-        return get_json_error(req_id, JSONRPC_INVALID_PARAMS, 'key is not settable')
+        return _invalid(req_id, 'key is not settable')
     value = params.get('value')
     _, min_value, max_value, _ = setter
-    # bool is an int subclass in Python; a JSON true/false must not pass as 1/0
-    if isinstance(value, bool) or not isinstance(value, int) or not min_value <= value <= max_value:
-        return get_json_error(req_id, JSONRPC_INVALID_PARAMS, 'invalid value')
-    try:
-        await asyncio.to_thread(Remote(SOCK_PATH).set_global, key, value)
-    except RpcError as e:
-        logger.info('set_global(%s=%s) failed: %s' % (key, value, e))
-        return get_json_error(req_id, JSONRPC_INTERNAL_ERROR, str(e))
-    except Exception as e:
-        logger.error('set_global(%s=%s) failed' % (key, value), exc_info=e)
-        return get_json_error(req_id, JSONRPC_INTERNAL_ERROR, 'internal error')
-    logger.info('set_global: %s=%s' % (key, value))
-    # push the change to every client as a normal global diff right away
-    Cached.update_now.set()
-    return get_json_response(req_id, {'key': key, 'value': value})
+    if not _valid_int(value, min_value, max_value):
+        return _invalid(req_id, 'invalid value')
+    response, ok = await _run_write(req_id, 'set_global: %s=%s' % (key, value),
+                                    Remote(SOCK_PATH).set_global, key, value)
+    return get_json_response(req_id, {'key': key, 'value': value}) if ok else response
+
+
+async def handle_torrent_action(req_id, params):  # M1
+    hash = params.get('hash')
+    action = params.get('action')
+    if not _valid_hash(hash):
+        return _invalid(req_id, 'invalid hash')
+    if action not in Remote.TORRENT_ACTIONS:
+        return _invalid(req_id, 'unknown action')
+    response, ok = await _run_write(req_id, 'torrent_action %s %s' % (action, hash),
+                                    Remote(SOCK_PATH).torrent_action, hash, action)
+    return get_json_response(req_id, {'hash': hash, 'action': action}) if ok else response
+
+
+async def handle_set_priority(req_id, params):  # M1
+    hash = params.get('hash')
+    value = params.get('priority')
+    if not _valid_hash(hash):
+        return _invalid(req_id, 'invalid hash')
+    if not _valid_int(value, 0, 3):
+        return _invalid(req_id, 'priority must be 0..3')
+    response, ok = await _run_write(req_id, 'set_priority %s=%s' % (hash, value),
+                                    Remote(SOCK_PATH).set_priority, hash, value)
+    return get_json_response(req_id, {'hash': hash, 'priority': value}) if ok else response
+
+
+async def handle_set_file_priority(req_id, params):  # M2
+    hash = params.get('hash')
+    index = params.get('file_index')
+    value = params.get('priority')
+    if not _valid_hash(hash):
+        return _invalid(req_id, 'invalid hash')
+    if not _valid_int(index, 0):
+        return _invalid(req_id, 'invalid file index')
+    if not _valid_int(value, 0, 2):
+        return _invalid(req_id, 'priority must be 0..2')
+    response, ok = await _run_write(req_id, 'set_file_priority %s:f%s=%s' % (hash, index, value),
+                                    Remote(SOCK_PATH).set_file_priority, hash, index, value)
+    return get_json_response(req_id, {'hash': hash, 'file_index': index, 'priority': value}) if ok else response
+
+
+async def handle_set_tracker_enabled(req_id, params):  # M2
+    hash = params.get('hash')
+    index = params.get('tracker_index')
+    enabled = params.get('enabled')
+    if not _valid_hash(hash):
+        return _invalid(req_id, 'invalid hash')
+    if not _valid_int(index, 0):
+        return _invalid(req_id, 'invalid tracker index')
+    if not _valid_int(enabled, 0, 1):
+        return _invalid(req_id, 'enabled must be 0 or 1')
+    response, ok = await _run_write(req_id, 'set_tracker_enabled %s:t%s=%s' % (hash, index, enabled),
+                                    Remote(SOCK_PATH).set_tracker_enabled, hash, index, enabled)
+    return get_json_response(req_id, {'hash': hash, 'tracker_index': index, 'enabled': enabled}) if ok else response
+
+
+async def handle_set_torrent_limit(req_id, params):  # M3
+    hash = params.get('hash')
+    key = params.get('key')
+    value = params.get('value')
+    if not _valid_hash(hash):
+        return _invalid(req_id, 'invalid hash')
+    if key not in Remote.TORRENT_LIMITS:
+        return _invalid(req_id, 'unknown limit')
+    if not _valid_int(value, 0):
+        return _invalid(req_id, 'invalid value')
+    response, ok = await _run_write(req_id, 'set_torrent_limit %s %s=%s' % (hash, key, value),
+                                    Remote(SOCK_PATH).set_torrent_limit, hash, key, value)
+    return get_json_response(req_id, {'hash': hash, 'key': key, 'value': value}) if ok else response
+
+
+async def handle_set_throttle_name(req_id, params):  # M3
+    hash = params.get('hash')
+    name = params.get('name')
+    if not _valid_hash(hash):
+        return _invalid(req_id, 'invalid hash')
+    if not isinstance(name, str):
+        return _invalid(req_id, 'invalid name')
+    # empty detaches; otherwise the group must be one rtremote created
+    if name and name not in Cached.throttle_groups:
+        return _invalid(req_id, 'unknown throttle group')
+    response, ok = await _run_write(req_id, 'set_throttle_name %s=%s' % (hash, name),
+                                    Remote(SOCK_PATH).set_throttle_name, hash, name)
+    return get_json_response(req_id, {'hash': hash, 'name': name}) if ok else response
+
+
+async def handle_set_label(req_id, params):  # M3
+    hash = params.get('hash')
+    label = params.get('label')
+    if not _valid_hash(hash):
+        return _invalid(req_id, 'invalid hash')
+    if not isinstance(label, str) or len(label) > Remote.LABEL_MAX or any(ord(c) < 0x20 for c in label):
+        return _invalid(req_id, 'invalid label')
+    response, ok = await _run_write(req_id, 'set_label %s=%s' % (hash, label),
+                                    Remote(SOCK_PATH).set_label, hash, label)
+    return get_json_response(req_id, {'hash': hash, 'label': label}) if ok else response
+
+
+async def handle_peer_action(req_id, params):  # M3
+    hash = params.get('hash')
+    peer = params.get('peer')
+    action = params.get('peer_action')
+    if not _valid_hash(hash):
+        return _invalid(req_id, 'invalid hash')
+    if not isinstance(peer, str) or not INFO_HASH_RE.fullmatch(peer):
+        return _invalid(req_id, 'invalid peer id')
+    if action not in Remote.PEER_ACTIONS:
+        return _invalid(req_id, 'unknown peer action')
+    response, ok = await _run_write(req_id, 'peer_action %s %s:p%s' % (action, hash, peer),
+                                    Remote(SOCK_PATH).peer_action, hash, peer, action)
+    return get_json_response(req_id, {'hash': hash, 'peer': peer, 'peer_action': action}) if ok else response
+
+
+async def handle_add_torrent(req_id, params):  # M2/M5
+    magnet = params.get('magnet')
+    content = params.get('content_b64')
+    start = params.get('start', True)
+    directory = params.get('directory')
+    label = params.get('label')
+    if not isinstance(start, bool):
+        return _invalid(req_id, 'start must be a boolean')
+    if isinstance(magnet, str) and MAGNET_RE.match(magnet):
+        magnet, content = magnet, None
+    elif isinstance(content, str) and content:
+        try:
+            base64.b64decode(content, validate=True)
+        except (binascii.Error, ValueError):
+            return _invalid(req_id, 'content_b64 is not valid base64')
+        magnet = None
+    else:
+        return _invalid(req_id, 'provide a magnet link or content_b64')
+    if directory is not None and (not isinstance(directory, str) or not SAFE_PATH_RE.match(directory)):
+        return _invalid(req_id, 'invalid directory')
+    if label is not None and (not isinstance(label, str) or len(label) > Remote.LABEL_MAX
+                              or any(ord(c) < 0x20 for c in label)):
+        return _invalid(req_id, 'invalid label')
+    response, ok = await _run_write(req_id, 'add_torrent',
+                                    Remote(SOCK_PATH).add_torrent, magnet, content, start, directory, label)
+    return get_json_response(req_id, {'added': True}) if ok else response
+
+
+async def handle_add_tracker(req_id, params):  # M5
+    hash = params.get('hash')
+    url = params.get('tracker_url')
+    if not _valid_hash(hash):
+        return _invalid(req_id, 'invalid hash')
+    if not isinstance(url, str) or not URI_RE.match(url):
+        return _invalid(req_id, 'invalid tracker url')
+    response, ok = await _run_write(req_id, 'add_tracker %s %s' % (hash, url),
+                                    Remote(SOCK_PATH).add_tracker, hash, url)
+    return get_json_response(req_id, {'hash': hash, 'tracker_url': url}) if ok else response
+
+
+async def handle_erase_torrent(req_id, params):  # M1 (bare) / M5 (with_data)
+    hash = params.get('hash')
+    with_data = params.get('with_data', False)
+    if not _valid_hash(hash):
+        return _invalid(req_id, 'invalid hash')
+    if not isinstance(with_data, bool):
+        return _invalid(req_id, 'with_data must be a boolean')
+    response, ok = await _run_write(req_id, 'erase_torrent %s with_data=%s' % (hash, with_data),
+                                    Remote(SOCK_PATH).erase_torrent, hash, with_data, RTR_DATA_ROOT)
+    return get_json_response(req_id, {'hash': hash, 'with_data': with_data}) if ok else response
+
+
+async def handle_move_data(req_id, params):  # M7
+    hash = params.get('hash')
+    directory = params.get('directory')
+    if not _valid_hash(hash):
+        return _invalid(req_id, 'invalid hash')
+    if not isinstance(directory, str) or not SAFE_PATH_RE.match(directory):
+        return _invalid(req_id, 'invalid directory')
+    response, ok = await _run_write(req_id, 'move_data %s -> %s' % (hash, directory),
+                                    Remote(SOCK_PATH).move_data, hash, directory, RTR_DATA_ROOT)
+    return get_json_response(req_id, {'hash': hash, 'directory': response}) if ok else response
+
+
+async def handle_throttle_group(req_id, params):  # M6
+    name = params.get('name')
+    up_kb = params.get('up_kb', 0)
+    down_kb = params.get('down_kb', 0)
+    if not isinstance(name, str) or not SAFE_GROUP_RE.match(name):
+        return _invalid(req_id, 'invalid group name')
+    if not _valid_int(up_kb, 0) or not _valid_int(down_kb, 0):
+        return _invalid(req_id, 'invalid rate')
+
+    def apply():
+        Remote(SOCK_PATH).throttle_group_set(name, up_kb, down_kb)
+        Cached.throttle_groups[name] = (up_kb, down_kb)
+
+    response, ok = await _run_write(req_id, 'throttle_group %s up=%s down=%s' % (name, up_kb, down_kb), apply)
+    return get_json_response(req_id, {'name': name, 'up_kb': up_kb, 'down_kb': down_kb}) if ok else response
+
+
+async def handle_set_schedule(req_id, params):  # M6
+    fields = {}
+    for key in ('up_day', 'down_day', 'up_night', 'down_night'):
+        value = params.get(key, 0)
+        if not _valid_int(value, 0):
+            return _invalid(req_id, 'invalid ' + key)
+        fields[key] = value
+    day = params.get('day_hhmm')
+    night = params.get('night_hhmm')
+    if not _valid_hhmm(day) or not _valid_hhmm(night):
+        return _invalid(req_id, 'times must be HH:MM')
+
+    def apply():
+        r = Remote(SOCK_PATH)
+        r.set_schedule(SCHEDULE_DAY_UP, day + ':00', 'throttle.global_up.max_rate.set_kb=%d' % fields['up_day'])
+        r.set_schedule(SCHEDULE_DAY_DOWN, day + ':00', 'throttle.global_down.max_rate.set_kb=%d' % fields['down_day'])
+        r.set_schedule(SCHEDULE_NIGHT_UP, night + ':00', 'throttle.global_up.max_rate.set_kb=%d' % fields['up_night'])
+        r.set_schedule(SCHEDULE_NIGHT_DOWN, night + ':00', 'throttle.global_down.max_rate.set_kb=%d' % fields['down_night'])
+
+    response, ok = await _run_write(req_id, 'set_schedule', apply)
+    return get_json_response(req_id, dict(fields, day_hhmm=day, night_hhmm=night)) if ok else response
+
+
+async def handle_clear_schedule(req_id, params):  # M6
+    def apply():
+        r = Remote(SOCK_PATH)
+        for name in (SCHEDULE_DAY_UP, SCHEDULE_DAY_DOWN, SCHEDULE_NIGHT_UP, SCHEDULE_NIGHT_DOWN):
+            r.remove_schedule(name)
+
+    response, ok = await _run_write(req_id, 'clear_schedule', apply)
+    return get_json_response(req_id, {'cleared': True}) if ok else response
+
+
+async def handle_add_view(req_id, params):  # M7
+    name = params.get('name')
+    preset = params.get('filter')
+    if not isinstance(name, str) or not SAFE_GROUP_RE.match(name) or name in Cached.VIEWS:
+        return _invalid(req_id, 'invalid or reserved view name')
+    condition = VIEW_FILTER_PRESETS.get(preset)
+    if condition is None:
+        return _invalid(req_id, 'unknown filter preset')
+
+    def apply():
+        Remote(SOCK_PATH).add_view(name, condition)
+        Cached.VIEWS.add(name)
+        Cached.custom_views[name] = preset
+
+    response, ok = await _run_write(req_id, 'add_view %s (%s)' % (name, preset), apply)
+    return get_json_response(req_id, {'name': name, 'filter': preset}) if ok else response
+
+
+def _valid_hhmm(value):
+    if not isinstance(value, str) or not re.fullmatch(r'[0-2][0-9]:[0-5][0-9]', value):
+        return False
+    hh = int(value[:2])
+    return hh < 24
+
+
+# safe filter presets a custom view may use; rtremote maps each to an rtorrent
+# filter expression, so no client-supplied condition text ever reaches rtorrent
+VIEW_FILTER_PRESETS = {
+    'all': '',
+    'active': 'greater=value=$d.up.rate=,value=0',
+    'downloading': 'd.complete=,false=',
+    'complete': 'd.complete=',
+    'seeding': 'and={d.complete=,d.is_open=}',
+    'stopped': 'not=$d.is_open=',
+}
+
+READ_HASH_METHODS = {'get_files', 'get_peers', 'get_trackers'}
+WRITE_HANDLERS = {
+    'set_global': handle_set_global,
+    'torrent_action': handle_torrent_action,
+    'set_priority': handle_set_priority,
+    'set_file_priority': handle_set_file_priority,
+    'set_tracker_enabled': handle_set_tracker_enabled,
+    'set_torrent_limit': handle_set_torrent_limit,
+    'set_throttle_name': handle_set_throttle_name,
+    'set_label': handle_set_label,
+    'peer_action': handle_peer_action,
+    'add_torrent': handle_add_torrent,
+    'add_tracker': handle_add_tracker,
+    'erase_torrent': handle_erase_torrent,
+    'move_data': handle_move_data,
+    'throttle_group': handle_throttle_group,
+    'set_schedule': handle_set_schedule,
+    'clear_schedule': handle_clear_schedule,
+    'add_view': handle_add_view,
+}
 
 
 async def global_data_updater(ready):

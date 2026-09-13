@@ -46,6 +46,10 @@ class RTorrentRpc:
         tag, value = p
         if tag == 'string':
             value = escape(str(value))
+        elif tag == 'base64':
+            # value is already base64 text (safe alphabet); strip whitespace so the
+            # element body is clean. Used for load.raw_start torrent payloads.
+            value = ''.join(str(value).split())
         return '<param><value><%s>%s</%s></value></param>' % (tag, value, tag)
 
     def _post(self, body, extra_headers=None):
@@ -89,6 +93,17 @@ class RTorrentRpc:
         # only usable for commands rtorrent marks safe (rpc.mark_safe)
         headers = [('UNTRUSTED_CONNECTION', 1)] if untrusted else None
         return self.call(command, [('string', ''), ('i8', int(value))], headers)
+
+    def target_command(self, command, target, args=None, untrusted=False):
+        # generic command whose first XML-RPC param is the target: '' for a
+        # global command, '<hash>' for a download, '<hash>:f<i>'/':t<i>'/':p<id>'
+        # for a file/tracker/peer (see rtorrent object_to_target). args is a list
+        # of (xml-type, value) tuples appended after the target.
+        params = [('string', target)]
+        if args:
+            params.extend(args)
+        headers = [('UNTRUSTED_CONNECTION', 1)] if untrusted else None
+        return self.call(command, params, headers)
 
     def get_struct(self, command):
         s = '<struct><member><name>methodName</name><value><string>' + escape(command) + \
