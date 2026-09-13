@@ -190,6 +190,7 @@ def test_register_main(srv):
         result = response['result']
         assert response['id'] == 7
         assert 'version' in result
+        assert result['rtremote_protocol_version'] == 1
         assert result['global']['throttle_global_down_max_rate'] == 1024
         assert result['global']['network_http_max_open'] == 32
         assert result['global']['system_api_version'] == 26

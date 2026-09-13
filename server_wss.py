@@ -32,6 +32,9 @@ RTR_PLUGINS_DISK_USAGE_PATHS = os.getenv('RTR_PLUGINS_DISK_USAGE_PATHS', '/')
 RTR_SEND_TIMEOUT = 10  # seconds to wait for a single client send before dropping it
 logger = Logger.get_logger()
 RTR_VERSION = '__RTR_VERSION_PLACEHOLDER__'
+# wire-contract level for the Android app's feature gating; bump only when the
+# protocol changes (new method, new field, changed shape) - never at release time
+RTR_PROTOCOL_VERSION = 1
 INFO_HASH_RE = re.compile('[0-9A-Fa-f]{40}')
 
 JSONRPC_METHOD_NOT_FOUND = -32601
@@ -309,7 +312,8 @@ async def handle_register(req, websocket):
         logger.error('register before the initial rtorrent snapshot; dropping client')
         return None
     await Cached.add_client(websocket, req['id'], view_name)
-    result = {'version': RTR_VERSION, 'global': data.__dict__, 'torrents': [t.__dict__ for t in torrents]}
+    result = {'version': RTR_VERSION, 'rtremote_protocol_version': RTR_PROTOCOL_VERSION,
+              'global': data.__dict__, 'torrents': [t.__dict__ for t in torrents]}
     plugins_data = {}
     for plugin in Cached.plugins:
         plugin_output = await plugin.get(False)
