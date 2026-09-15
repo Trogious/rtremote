@@ -37,7 +37,25 @@ last release compatible with it.
 Get the `rtorrent remote` app from the Google Play store, configure it to point to this server, have fun.
 
 ### Troubleshooting
-In case of issues, you can increase the logging level from INFO (default) to DEBUG by editing `utils.py`. The rotating log file location is set by `RTR_LOG_PATH`.
+The log file (`RTR_LOG_PATH`, rotating) is written so that you can tell **which component a problem is in** without reading code. Every line has the form
+
+```
+2026-09-13 17:13:31|WARNING|app|390|registration refused for ('192.168.1.20', 51234): secret key mismatch -> the secret key entered in the app is not the one whose SHA1 is RTR_SECRET_KEY_SHA1; ...
+```
+
+The third column is the component to look at:
+
+| Column value | Meaning | Typical lines |
+| ------------ | ------- | ------------- |
+| `rtorrent`   | rtorrent is down, unreachable, hung, too old, or rejected a command | SCGI socket not found / connection refused / no answer within `RTR_SCGI_TIMEOUT`; "does not know the command" (rtorrent < 0.16); "rtorrent is back after Ns" |
+| `app`        | what arrived from the phone is the problem | secret key mismatch; the app rejected the TLS certificate (keystore / "accept self-signed"); the app asked for a method this rtremote does not have (update rtremote); a torrent the app acted on no longer exists; the phone stopped reading |
+| `rtremote`   | this server: configuration, deployment, or a bug | certificate file missing or unreadable; listen port already in use; `RTR_DATA_ROOT` unset or not writable; anything with a traceback (please report it) |
+
+Everything after `->` is what to check. Errors the app displays are prefixed the same way (`rtorrent: ...`, `rtremote: ...`, `app: ...`).
+
+Startup writes a banner (`starting rtremote ...`, `config: ...`, `connected: rtorrent ...`, `listening on wss://...`); paste those lines into a bug report. An rtorrent outage is logged once when it starts and once when rtorrent is back, not on every failed poll.
+
+`RTR_LOG_LEVEL` (default `INFO`) can be set to `DEBUG` in `start.sh` for per-message detail.
 
 ### Testing locally
 The test suite in `test/` includes a fake rtorrent (`test/fake_rtorrent.py`), so the end-to-end smoke tests run on any OS without a real rtorrent:
