@@ -1,8 +1,10 @@
 def map_diff(old, new):
+    # either snapshot may lack keys the other has; the wire diff cannot express
+    # a removed key, so keys gone from new are skipped, keys new grew are sent
     diff = {}
-    for key in old.keys():
-        if old[key] != new[key]:
-            diff[key] = new[key]
+    for key, value in new.items():
+        if key not in old or old[key] != value:
+            diff[key] = value
     return diff
 
 
