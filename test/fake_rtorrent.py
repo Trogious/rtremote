@@ -11,7 +11,8 @@ Speaks just enough of the XML-RPC dialect for server_wss.py:
 - d.multicall / t.multicall / p.multicall / f.multicall
 - plain getters and *.set / *.set_kb setters (for update-propagation tests);
   requests carrying UNTRUSTED_CONNECTION=1 are rejected for commands outside
-  rtorrent's untrusted-safe allowlist, like the real thing
+  the set that actually works on an untrusted connection to the real thing
+  (UNTRUSTED_SAFE below)
 - per-torrent actions (d.start/stop/pause/resume/open/close/check_hash/erase),
   file priority (f.priority.set), tracker enable (t.is_enabled.set) and insert
   (d.tracker.insert), peer actions (p.banned/snubbed/disconnect via <hash>:p<id>),
@@ -46,10 +47,18 @@ CONDITION_PREDS = {
     'not=$d.is_open=': lambda t: t['d.is_open'] == 0,
 }
 
-# commands rtorrent marks rpc.mark_safe (usable on UNTRUSTED_CONNECTION=1
-# requests), per v0.16.22 and master; like the real thing, the fake rejects
-# any other command arriving on an untrusted request - this catches rtremote
-# sending the untrusted header for a command rtorrent does not allow it on
+# commands that work on an UNTRUSTED_CONNECTION=1 request against rtorrent
+# v0.16.22 / master; like the real thing, the fake rejects any other command
+# arriving on an untrusted request - this catches rtremote sending the header
+# for a command rtorrent does not allow it on. rtorrent's rpc.mark_safe list
+# also holds d.pause/d.resume/d.open/d.close/d.check_hash/d.erase, but those
+# are deliberately NOT here: rtorrent checks the per-request trust flag on
+# every nested command too, and those actions' implementations call
+# d.state_changed.set, d.hashing.set, system.file.allocate and the
+# event.download.* handlers (none safe), so under the header they fail midway
+# (d.open faults; the others return success but stop or skip the real work:
+# d.check_hash stops the torrent, wipes its resume data and never queues the
+# rehash). The fake models the outcome: they fault when sent untrusted.
 UNTRUSTED_SAFE = {
     # global rate/slot/peer setters
     'throttle.global_up.max_rate.set_kb', 'throttle.global_down.max_rate.set_kb',
@@ -57,8 +66,6 @@ UNTRUSTED_SAFE = {
     'throttle.max_uploads.set', 'throttle.max_downloads.set',
     'throttle.min_peers.normal.set', 'throttle.max_peers.normal.set',
     'throttle.min_peers.seed.set', 'throttle.max_peers.seed.set',
-    # per-torrent actions rtorrent marks safe (start/stop/announce are NOT here)
-    'd.pause', 'd.resume', 'd.open', 'd.close', 'd.check_hash', 'd.erase',
     # file / tracker / peer writes rtorrent marks safe
     'f.priority.set', 't.is_enabled.set',
     'p.banned.set', 'p.snubbed.set', 'p.disconnect',

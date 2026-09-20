@@ -31,9 +31,13 @@ def classify_fault(code, string, command):
                         'the app acted on a torrent rtorrent no longer has; its list refreshes on the next push',
                         WHERE_APP, code, command)
     if 'not allowed for untrusted connections' in text:
-        return RpcError('rtorrent refused %s as untrusted' % (command or 'the command'),
-                        'rtremote sent this command with UNTRUSTED_CONNECTION=1 but rtorrent does not mark it '
-                        'safe; this is an rtremote bug, please report it', WHERE_RTREMOTE, code, command)
+        # the fault names the command rtorrent actually refused, which may be one
+        # the requested command runs internally (system.file.allocate under
+        # d.open, say), so keep it in the message
+        return RpcError('rtorrent refused %s as untrusted: %s' % (command or 'the command', text),
+                        'rtremote sent this command with UNTRUSTED_CONNECTION=1 but rtorrent does not allow it '
+                        '(or a command it runs internally) on untrusted connections; this is an rtremote bug, '
+                        'please report it', WHERE_RTREMOTE, code, command)
     if 'not defined' in text or 'Method' in text and 'unknown' in text.lower():
         return RpcError('rtorrent does not know the command %s' % (command or ''),
                         'this rtorrent is too old or built without the command; rtremote needs rtorrent >= 0.16',
@@ -132,7 +136,9 @@ class RTorrentRpc:
     def set_value(self, command, value, untrusted=False):
         # untrusted=True sends rtorrent's UNTRUSTED_CONNECTION=1 SCGI header, so
         # rtorrent's own untrusted-safe allowlist applies as defence in depth;
-        # only usable for commands rtorrent marks safe (rpc.mark_safe)
+        # only usable for commands rtorrent marks safe (rpc.mark_safe) AND whose
+        # implementation runs no unsafe command internally - the flag is checked
+        # on nested calls too (see Remote.TORRENT_ACTIONS)
         headers = [('UNTRUSTED_CONNECTION', 1)] if untrusted else None
         return self.call(command, [('string', ''), ('i8', int(value))], headers)
 

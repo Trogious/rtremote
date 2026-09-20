@@ -133,12 +133,20 @@ The Android app speaks JSON-RPC 2.0 over a single persistent secure WebSocket.
   - `add_view {name, filter}` (filter is a safe preset rtremote maps to an
     rtorrent expression), `move_data {hash, directory}` (level 8).
   - Write calls carry rtorrent's `UNTRUSTED_CONNECTION=1` header only for
-    commands on rtorrent's own `mark_safe` list (per-command flags in
-    `Remote.TORRENT_ACTIONS` / `GLOBAL_SETTERS` and the file/tracker/peer
-    setters); `d.start`/`d.stop`/`d.tracker_announce`, the per-torrent limit
-    setters, `d.priority.set`, `d.throttle_name.set`, `d.custom1.set`,
-    `d.directory.set`, `load.*`, `d.tracker.insert`, `throttle.*`, `schedule`
-    and `view.*` are **not** safe and go out trusted.
+    the global throttle / peer-limit setters flagged in `Remote.GLOBAL_SETTERS`
+    and the file/tracker/peer setters (`f.priority.set`, `t.is_enabled.set`,
+    `p.banned.set`, `p.snubbed.set`, `p.disconnect`). Everything else goes out
+    trusted, including **every per-torrent action** (`Remote.TORRENT_ACTIONS`),
+    `d.erase` and the `d.close`/`d.open` pair inside `move_data`. rtorrent does
+    mark `d.pause`/`d.resume`/`d.open`/`d.close`/`d.check_hash`/`d.erase` safe,
+    but they are unusable under the header: the trust flag is per request and
+    `CommandMap::call_command` checks it for every nested command too, and
+    those actions' implementations (`core/download_list.cc`) call
+    `d.state_changed.set`, `d.hashing.set`, `system.file.allocate` and the
+    `event.download.*` handlers, none of which is safe. Sent untrusted,
+    `d.check_hash` stopped the torrent, wiped its resume data and never queued
+    the rehash (seen in the field), and `d.open` faults outright. Verified
+    against v0.16.22 and master; never re-add the header for a `d.*` action.
 
 Error handling, by client state:
 - **Unauthenticated** sockets get no feedback: invalid JSON, malformed
@@ -407,12 +415,15 @@ CLI flags: `-f` / `--foreground` — do not daemonize.
   unset. rtremote never deletes or moves a path outside that root.
 - Write calls carry rtorrent's `UNTRUSTED_CONNECTION=1` SCGI header where
   rtorrent's own untrusted-safe allowlist (`rpc.mark_safe`) covers the
-  command, so rtorrent enforces a second allowlist as defence in depth.
+  command **and** the command's implementation runs no unsafe command
+  internally, so rtorrent enforces a second allowlist as defence in depth.
   Verified against rtorrent v0.16.22 and master: the six throttle setters
-  are on that list; `system.sockets.max_size.set` and
-  `network.listen.port.set` are **not** and must go out as normal trusted
-  calls (the untrusted-safe flag lives per entry in
-  `Remote.GLOBAL_SETTERS`).
+  and the four peer-limit setters are on that list and work under the
+  header; `system.sockets.max_size.set` and `network.listen.port.set` are
+  **not** and must go out as normal trusted calls (the untrusted-safe flag
+  lives per entry in `Remote.GLOBAL_SETTERS`); the per-torrent actions
+  rtorrent marks safe break midway under the header (see the protocol
+  section), so every `d.*` command goes out trusted.
 
 ## Testing
 
@@ -430,7 +441,9 @@ The `test/` package is pytest-driven:
   deprecated ones — api_version 26, compact tinyxml2 XML, per-command fault
   structs for unknown commands in `system.multicall`; global
   getters/setters incl. `.set_kb` KB scaling, enforcement of the
-  untrusted-safe allowlist for `UNTRUSTED_CONNECTION=1` requests, all four
+  untrusted-safe allowlist for `UNTRUSTED_CONNECTION=1` requests (minus the
+  six `d.*` actions that break under the header on the real thing, which
+  the fake faults on so a re-added header fails the smoke tests), all four
   multicalls, `fake.add_torrent` / `fake.remove_torrent` /
   `fake.fail_next_set` / `fake.was_untrusted` control methods).
 - **`wss_smoke_test.py`** — full end-to-end protocol suite against the fake,

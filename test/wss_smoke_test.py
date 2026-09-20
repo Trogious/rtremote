@@ -692,11 +692,19 @@ def test_m1_torrent_actions(srv):
         assert srv.state.torrents[h]['d.is_open'] == 1
         await _call(ws, 'torrent_action', {'hash': h, 'action': 'pause'}, 203)
         assert srv.state.torrents[h]['d.is_active'] == 0
+        for i, action in enumerate(('resume', 'close', 'open', 'check_hash', 'announce')):
+            r = await _call(ws, 'torrent_action', {'hash': h, 'action': action}, 210 + i)
+            assert r['result'] == {'hash': h, 'action': action}, r
+        assert srv.state.torrents[h]['d.is_hash_checking'] == 1
         r = await _call(ws, 'set_priority', {'hash': h, 'priority': 3}, 204)
         assert srv.state.torrents[h]['d.priority'] == 3
-        # start/stop are not untrusted-safe; pause is
-        assert not _was_untrusted(srv, 'd.stop')
-        assert _was_untrusted(srv, 'd.pause')
+        # no per-torrent action may carry the untrusted header: start/stop/
+        # announce are not marked safe, and the ones rtorrent does mark safe
+        # (pause/resume/open/close/check_hash) break midway under it because
+        # their implementations run unsafe commands - the fake faults on them
+        for command in ('d.start', 'd.stop', 'd.pause', 'd.resume', 'd.open',
+                        'd.close', 'd.check_hash', 'd.tracker_announce'):
+            assert not _was_untrusted(srv, command), command
         # rejections
         assert (await _call(ws, 'torrent_action', {'hash': 'zz', 'action': 'stop'}, 205))['error']['code'] == -32602
         assert (await _call(ws, 'torrent_action', {'hash': h, 'action': 'bogus'}, 206))['error']['code'] == -32602
@@ -859,6 +867,9 @@ def test_m5_erase_with_data(srv_data):
     asyncio.run(run())
     assert not os.path.exists(os.path.join(tdir, 'payload.bin'))
     assert h not in srv_data.state.torrents
+    # d.erase is marked safe but runs close() and the event.download.erased
+    # hooks (d.delete_tied etc.), which fail under the header
+    assert not _was_untrusted(srv_data, 'd.erase')
 
 
 def test_m7_move_data(srv_data):
@@ -880,6 +891,9 @@ def test_m7_move_data(srv_data):
     assert os.path.exists(os.path.join(dst_parent, 'show', 'ep1.mkv'))
     assert not os.path.exists(os.path.join(src, 'ep1.mkv'))
     assert srv_data.state.torrents[h]['d.directory'] == os.path.join(dst_parent, 'show')
+    # the close/open around the move go out trusted for the same reason
+    for command in ('d.close', 'd.open'):
+        assert not _was_untrusted(srv_data, command), command
 
 
 def test_move_data_disabled_without_root(srv):

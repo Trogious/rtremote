@@ -68,18 +68,26 @@ class Remote:
         'throttle_max_peers_seed': ('throttle.max_peers.seed.set', -1, XMLRPC_I8_MAX, True),
     }
 
-    # per-torrent action -> (rtorrent command, untrusted-safe). d.start/d.stop run
-    # embedded visibility commands and d.tracker_announce hits the network, so
-    # rtorrent does NOT mark them safe (verified v0.16.22 + master); the rest are.
+    # per-torrent action -> rtorrent command. None of these carries the
+    # UNTRUSTED_CONNECTION=1 header. d.start/d.stop/d.tracker_announce are not on
+    # rtorrent's mark_safe list; d.pause/d.resume/d.open/d.close/d.check_hash (and
+    # d.erase) are, but are unusable under the header: rtorrent's trust flag is
+    # per request and CommandMap::call_command checks it for every nested command
+    # too, and these actions' implementations (core/download_list.cc) call
+    # d.state_changed.set, d.state_counter.set, d.hashing.set, system.file.allocate
+    # and the event.download.* handlers - none of them safe. Sent untrusted,
+    # d.check_hash stops the torrent, wipes its resume data and never queues the
+    # rehash, d.pause/d.resume/d.close skip their state bookkeeping and event
+    # hooks, and d.open faults outright (verified v0.16.22 and master 20002ce).
     TORRENT_ACTIONS = {
-        'start': ('d.start', False),
-        'stop': ('d.stop', False),
-        'pause': ('d.pause', True),
-        'resume': ('d.resume', True),
-        'open': ('d.open', True),
-        'close': ('d.close', True),
-        'check_hash': ('d.check_hash', True),
-        'announce': ('d.tracker_announce', False),
+        'start': 'd.start',
+        'stop': 'd.stop',
+        'pause': 'd.pause',
+        'resume': 'd.resume',
+        'open': 'd.open',
+        'close': 'd.close',
+        'check_hash': 'd.check_hash',
+        'announce': 'd.tracker_announce',
     }
     # per-torrent integer limits (M3) -> rtorrent setter (none untrusted-safe)
     TORRENT_LIMITS = {
@@ -170,8 +178,7 @@ class Remote:
     # ---- writes (M1-M7); callers validate params, these build rtorrent calls ----
 
     def torrent_action(self, hash, action):
-        command, safe = Remote.TORRENT_ACTIONS[action]
-        self.rpc.target_command(command, hash, untrusted=safe)
+        self.rpc.target_command(Remote.TORRENT_ACTIONS[action], hash)
 
     def set_priority(self, hash, value):
         # d.priority.set, 0 off / 1 low / 2 normal / 3 high (not untrusted-safe)
@@ -238,7 +245,10 @@ class Remote:
             directory, paths = self.get_file_paths(hash)
             for p in paths:
                 Remote._require_under(p, data_root)
-        self.rpc.target_command('d.erase', hash, untrusted=True)
+        # trusted: d.erase is marked safe but runs close() and the
+        # event.download.erased hooks (ui.unfocus_download, d.delete_tied, user
+        # hooks), which fail under the untrusted header - see TORRENT_ACTIONS
+        self.rpc.target_command('d.erase', hash)
         if with_data:
             for p in paths:
                 try:
@@ -262,12 +272,12 @@ class Remote:
         base = os.path.basename(src_dir.rstrip('/'))
         dst = os.path.join(directory, base)
         Remote._require_under(dst, data_root)
-        self.rpc.target_command('d.close', hash, untrusted=True)
+        self.rpc.target_command('d.close', hash)  # trusted, see TORRENT_ACTIONS
         os.makedirs(directory, exist_ok=True)
         if os.path.exists(src_dir):
             shutil.move(src_dir, dst)
         self.rpc.target_command('d.directory.set', hash, [('string', dst)])
-        self.rpc.target_command('d.open', hash, untrusted=True)
+        self.rpc.target_command('d.open', hash)  # trusted, see TORRENT_ACTIONS
         return dst
 
     def throttle_group_set(self, name, up_kb, down_kb):
