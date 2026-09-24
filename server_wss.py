@@ -852,7 +852,12 @@ async def short_caches_cleaner():
 
 async def on_message(websocket):
     try:
-        diag.app('connection from %s' % str(websocket.remote_address), level=logging.INFO)
+        # compression is negotiated per connection: the app offers permessage-deflate and
+        # serve() accepts it by default, so 'none' means an app build from before OkHttp or
+        # something in between (a reverse proxy) that stripped the extension
+        compression = ', '.join(e.name for e in websocket.protocol.extensions) or 'none'
+        diag.app('connection from %s, compression: %s' % (str(websocket.remote_address), compression),
+                 level=logging.INFO)
         async for message in websocket:
             response, keep = await process_request(message, websocket)
             if not keep:

@@ -961,3 +961,27 @@ def test_m7_custom_view_filters(srv):
         assert saw_proper_subset
         await ws.close()
     asyncio.run(run())
+
+
+def test_compression_negotiated_and_logged(srv):
+    # the app (OkHttp) offers the bare permessage-deflate extension, without the
+    # client_max_window_bits parameter browsers add; serve()'s default configuration
+    # must still accept it, and the connection line must say so, so a stripped extension
+    # (a reverse proxy in between) or an app build from before OkHttp shows up in the
+    # log as "compression: none"
+    from websockets.extensions.permessage_deflate import ClientPerMessageDeflateFactory
+
+    async def run():
+        bare = ClientPerMessageDeflateFactory(client_max_window_bits=None)
+        ws = await websockets.connect(srv.uri, ssl=_ssl_ctx(), compression=None, extensions=[bare])
+        assert [e.name for e in ws.protocol.extensions] == ['permessage-deflate']
+        assert ws.response.headers.get('Sec-WebSocket-Extensions', '').startswith('permessage-deflate')
+        await ws.send(_req('register', {'secret_key': SECRET}))
+        response = json.loads(await asyncio.wait_for(ws.recv(), 5))
+        assert 'result' in response
+        await ws.close()
+
+    asyncio.run(run())
+    log = _read_log(srv)
+    assert any('|INFO|app|' in l and 'connection from' in l and 'compression: permessage-deflate' in l
+               for l in log.splitlines()), log
