@@ -643,9 +643,19 @@ async def handle_erase_torrent(req_id, params):  # M1 (bare) / M5 (with_data)
         return _invalid(req_id, 'invalid hash')
     if not isinstance(with_data, bool):
         return _invalid(req_id, 'with_data must be a boolean')
-    response, ok = await _run_write(req_id, 'erase_torrent %s with_data=%s' % (hash, with_data),
-                                    Remote(SOCK_PATH).erase_torrent, hash, with_data, RTR_DATA_ROOT)
-    return get_json_response(req_id, {'hash': hash, 'with_data': with_data}) if ok else response
+    label = 'erase_torrent %s with_data=%s' % (hash, with_data)
+    outcome, ok = await _run_write(req_id, label, Remote(SOCK_PATH).erase_torrent, hash, with_data, RTR_DATA_ROOT)
+    if not ok:
+        return outcome
+    for path in outcome.kept:
+        diag.rtremote('%s: kept %s, it still holds files that are not part of the torrent' % (label, path),
+                      level=logging.INFO)
+    if outcome.failed:
+        # rtorrent has already erased the torrent (its del push is on the way);
+        # the app is told what stayed on disk instead of a silent ok
+        where, message = log_failure('%s data deletion' % label, Remote.left_behind_error(outcome))
+        return get_json_error(req_id, JSONRPC_INTERNAL_ERROR, error_text(where, message))
+    return get_json_response(req_id, {'hash': hash, 'with_data': with_data})
 
 
 async def handle_move_data(req_id, params):  # M7

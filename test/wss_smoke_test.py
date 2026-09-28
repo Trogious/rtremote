@@ -4,7 +4,8 @@ Spawns the fake SCGI server from fake_rtorrent.py plus a real (daemonized)
 server_wss.py in an isolated temp directory, then exercises the full protocol:
 registration per view, detail requests, diff pushes, per-view filtering of new
 torrents, set_global writes (allowlist, validation, untrusted-safe header,
-immediate push), error handling, and updater resilience to an rtorrent outage.
+immediate push), error handling, updater resilience to an rtorrent outage, and
+the filesystem side of erase-with-data / move-data against a real temp data root.
 
 The fake mimics rtorrent 0.16.x (current command names, api_version 26,
 compact tinyxml2 XML), matching what this server version requires.
@@ -850,50 +851,213 @@ def test_m7_add_view(srv):
     asyncio.run(run())
 
 
+def _file_record(path, size=16):
+    return {'f.size_chunks': 1, 'f.completed_chunks': 1, 'f.priority': 1, 'f.size_bytes': size, 'f.path': path}
+
+
+def _write_file(path, data=b'x' * 16):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, 'wb') as f:
+        f.write(data)
+
+
+def _erase(srv, hash, with_data, id):
+    async def run():
+        ws, _ = await _connect(srv)
+        r = await _call(ws, 'erase_torrent', {'hash': hash, 'with_data': with_data}, id)
+        await ws.close()
+        return r
+    return asyncio.run(run())
+
+
+def _move(srv, hash, directory, id):
+    async def run():
+        ws, _ = await _connect(srv)
+        r = await _call(ws, 'move_data', {'hash': hash, 'directory': directory}, id)
+        await ws.close()
+        return r
+    return asyncio.run(run())
+
+
+def _log_line(srv, *needles, timeout=3):
+    # the daemon writes its log from another process: give it a moment
+    deadline = time.time() + timeout
+    while True:
+        lines = _read_log(srv).splitlines()
+        hits = [l for l in lines if all(n in l for n in needles)]
+        if hits or time.time() > deadline:
+            return hits
+
+
 def test_m5_erase_with_data(srv_data):
+    # a multi-file torrent owns d.directory (<parent>/<name>): its files go,
+    # then the now-empty directories of its own layout deepest first (including
+    # one whose file was never downloaded), then the folder itself - and
+    # nothing above it
     h = 'E' * 40
     tdir = os.path.join(srv_data.data_root, 'erase-me')
-    os.makedirs(tdir, exist_ok=True)
-    with open(os.path.join(tdir, 'payload.bin'), 'wb') as f:
-        f.write(b'x' * 16)
-    srv_data.state.add_torrent(h, 'erase-me', 16, directory=tdir,
-                               files=[{'f.size_chunks': 1, 'f.completed_chunks': 1, 'f.priority': 1,
-                                       'f.size_bytes': 16, 'f.path': 'payload.bin'}])
-    async def run():
-        ws, _ = await _connect(srv_data)
-        r = await _call(ws, 'erase_torrent', {'hash': h, 'with_data': True}, 290)
-        assert r['result'] == {'hash': h, 'with_data': True}
-        await ws.close()
-    asyncio.run(run())
-    assert not os.path.exists(os.path.join(tdir, 'payload.bin'))
+    layout = ['payload.bin', 'Sub/part1.bin', 'Sub/Deeper/part2.bin', 'Skipped/never.bin']
+    for rel in layout[:-1]:
+        _write_file(os.path.join(tdir, rel))
+    os.makedirs(os.path.join(tdir, 'Skipped'))  # a priority-off file: directory created, file never written
+    srv_data.state.add_torrent(h, 'erase-me', 48, directory=tdir, files=[_file_record(rel) for rel in layout])
+    assert srv_data.state.torrents[h]['d.is_multi_file'] == 1
+    r = _erase(srv_data, h, True, 290)
+    assert r['result'] == {'hash': h, 'with_data': True}
+    assert not os.path.exists(tdir)
+    assert os.path.isdir(srv_data.data_root)
     assert h not in srv_data.state.torrents
     # d.erase is marked safe but runs close() and the event.download.erased
     # hooks (d.delete_tied etc.), which fail under the header
     assert not _was_untrusted(srv_data, 'd.erase')
 
 
-def test_m7_move_data(srv_data):
-    h = 'F' * 40
-    src = os.path.join(srv_data.data_root, 'show')
-    os.makedirs(src, exist_ok=True)
-    with open(os.path.join(src, 'ep1.mkv'), 'wb') as f:
-        f.write(b'y' * 16)
-    dst_parent = os.path.join(srv_data.data_root, 'archive')
-    srv_data.state.add_torrent(h, 'show', 16, directory=src,
-                               files=[{'f.size_chunks': 1, 'f.completed_chunks': 1, 'f.priority': 1,
-                                       'f.size_bytes': 16, 'f.path': 'ep1.mkv'}])
+def test_m5_erase_with_data_keeps_folders_holding_other_files(srv_data):
+    # only os.remove / os.rmdir are ever used: a file the user put into the
+    # torrent's folder keeps that folder (and its parents) alive, and the log
+    # says which one
+    h = 'E' * 39 + '1'
+    tdir = os.path.join(srv_data.data_root, 'keep-me')
+    _write_file(os.path.join(tdir, 'a.bin'))
+    _write_file(os.path.join(tdir, 'Sub', 'b.bin'))
+    _write_file(os.path.join(tdir, 'Sub', 'notes.txt'), b'mine')
+    srv_data.state.add_torrent(h, 'keep-me', 32, directory=tdir,
+                               files=[_file_record('a.bin'), _file_record('Sub/b.bin')])
+    r = _erase(srv_data, h, True, 291)
+    assert r['result'] == {'hash': h, 'with_data': True}
+    assert not os.path.exists(os.path.join(tdir, 'a.bin'))
+    assert not os.path.exists(os.path.join(tdir, 'Sub', 'b.bin'))
+    assert os.path.exists(os.path.join(tdir, 'Sub', 'notes.txt'))
+    assert _log_line(srv_data, '|INFO|rtremote|', 'erase_torrent %s' % h,
+                     'kept %s,' % os.path.join(tdir, 'Sub'), 'not part of the torrent')
+
+
+def test_m5_erase_with_data_single_file_keeps_the_shared_directory(srv_data):
+    # for a single-file torrent d.directory is the download directory itself,
+    # shared with every other torrent: the file goes, the directory stays even
+    # when it ends up empty
+    h = 'E' * 39 + '2'
+    shared = os.path.join(srv_data.data_root, 'downloads')
+    _write_file(os.path.join(shared, 'lonely.iso'))
+    srv_data.state.add_torrent(h, 'lonely.iso', 16, directory=shared, files=[_file_record('lonely.iso')])
+    assert srv_data.state.torrents[h]['d.is_multi_file'] == 0
+    r = _erase(srv_data, h, True, 292)
+    assert r['result'] == {'hash': h, 'with_data': True}
+    assert not os.path.exists(os.path.join(shared, 'lonely.iso'))
+    assert os.path.isdir(shared)
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason='root is not stopped by directory permissions')
+def test_m5_erase_with_data_reports_what_it_could_not_delete(srv_data):
+    # rtorrent has already erased the torrent when a file turns out to be
+    # undeletable: the app gets an error naming the path and the log blames
+    # rtremote's rights, instead of a silent "ok" with data left behind
+    h = 'E' * 39 + '3'
+    tdir = os.path.join(srv_data.data_root, 'locked')
+    locked = os.path.join(tdir, 'Sub')
+    _write_file(os.path.join(tdir, 'free.bin'))
+    _write_file(os.path.join(locked, 'stuck.bin'))
+    os.chmod(locked, 0o555)
+    try:
+        srv_data.state.add_torrent(h, 'locked', 32, directory=tdir,
+                                   files=[_file_record('free.bin'), _file_record('Sub/stuck.bin')])
+        r = _erase(srv_data, h, True, 293)
+        assert r['error']['code'] == -32603, r
+        assert r['error']['message'].startswith('rtremote: permission denied'), r
+        assert '1 of its 2 files' in r['error']['message'], r
+        assert os.path.join(locked, 'stuck.bin') in r['error']['message'], r
+        assert h not in srv_data.state.torrents
+        assert not os.path.exists(os.path.join(tdir, 'free.bin'))
+        assert os.path.exists(os.path.join(locked, 'stuck.bin'))
+        assert _log_line(srv_data, '|ERROR|rtremote|', 'erase_torrent %s' % h, 'data deletion failed',
+                         'permission denied', 'RTR_DATA_ROOT ownership')
+    finally:
+        os.chmod(locked, 0o755)
+
+
+def test_details_of_an_erased_torrent_blame_the_app(srv):
+    # the app's details screen can ask for files/trackers/peers once more right
+    # after an erase (seen in the field). rtorrent 0.16 answers "invalid
+    # parameters: info-hash not found": that is the app's stale hash, not an
+    # rtorrent problem, in the error text and in the log
+    h = '0' * 39 + '9'
     async def run():
-        ws, _ = await _connect(srv_data)
-        r = await _call(ws, 'move_data', {'hash': h, 'directory': dst_parent}, 300)
-        assert r['result']['directory'] == os.path.join(dst_parent, 'show')
+        ws, _ = await _connect(srv)
+        for i, method in enumerate(('get_files', 'get_trackers', 'get_peers')):
+            r = await _call(ws, method, {'hash': h}, 294 + i)
+            assert r['error']['code'] == -32603, r
+            assert r['error']['message'].startswith('app: rtorrent has no torrent with that hash'), r
         await ws.close()
     asyncio.run(run())
+    for method in ('get_files', 'get_trackers', 'get_peers'):
+        call = '%s(%s)' % (method, h)
+        assert _log_line(srv, '|WARNING|app|', call, 'no torrent with that hash', 'refreshes on the next push'), method
+        assert not _log_line(srv, '|rtorrent|', call, timeout=0), method
+
+
+def test_m7_move_data(srv_data):
+    # a multi-file torrent's folder moves as a whole under the new directory
+    # and becomes the root literally (d.directory.base.set: d.directory.set
+    # would append the torrent name a second time); an active torrent is
+    # resumed again afterwards
+    h = 'F' * 40
+    src = os.path.join(srv_data.data_root, 'show')
+    _write_file(os.path.join(src, 'ep1.mkv'), b'y' * 16)
+    _write_file(os.path.join(src, 'Extras', 'ep2.mkv'), b'z' * 16)
+    dst_parent = os.path.join(srv_data.data_root, 'archive')
+    srv_data.state.add_torrent(h, 'show', 32, directory=src, is_open=1, is_active=1,
+                               files=[_file_record('ep1.mkv'), _file_record('Extras/ep2.mkv')])
+    r = _move(srv_data, h, dst_parent, 300)
+    assert r['result']['directory'] == os.path.join(dst_parent, 'show')
     assert os.path.exists(os.path.join(dst_parent, 'show', 'ep1.mkv'))
-    assert not os.path.exists(os.path.join(src, 'ep1.mkv'))
-    assert srv_data.state.torrents[h]['d.directory'] == os.path.join(dst_parent, 'show')
-    # the close/open around the move go out trusted for the same reason
-    for command in ('d.close', 'd.open'):
+    assert os.path.exists(os.path.join(dst_parent, 'show', 'Extras', 'ep2.mkv'))
+    assert not os.path.exists(src)
+    t = srv_data.state.torrents[h]
+    assert t['d.directory'] == os.path.join(dst_parent, 'show')
+    assert (t['d.is_open'], t['d.is_active']) == (1, 1)
+    # the close and restart around the move go out trusted for the same reason
+    # (d.resume, not d.start: a d.close'd torrent is still in the started view)
+    for command in ('d.close', 'd.resume', 'd.directory.base.set'):
         assert not _was_untrusted(srv_data, command), command
+
+
+def test_m7_move_data_single_file_moves_only_the_file(srv_data):
+    # for a single-file torrent d.directory is the shared download directory:
+    # only the torrent's own file moves, the destination itself becomes its
+    # root, the neighbours stay put, and open-but-stopped stays that way
+    h = 'F' * 39 + '1'
+    shared = os.path.join(srv_data.data_root, 'downloads')
+    _write_file(os.path.join(shared, 'movie.mkv'))
+    _write_file(os.path.join(shared, 'someone-elses.mkv'))
+    dst = os.path.join(srv_data.data_root, 'movies')
+    srv_data.state.add_torrent(h, 'movie.mkv', 16, directory=shared, is_open=1, is_active=0,
+                               files=[_file_record('movie.mkv')])
+    r = _move(srv_data, h, dst, 301)
+    assert r['result']['directory'] == dst
+    assert os.path.exists(os.path.join(dst, 'movie.mkv'))
+    assert os.path.exists(os.path.join(shared, 'someone-elses.mkv'))
+    assert not os.path.exists(os.path.join(shared, 'movie.mkv'))
+    t = srv_data.state.torrents[h]
+    assert t['d.directory'] == dst
+    assert (t['d.is_open'], t['d.is_active']) == (1, 0)
+
+
+def test_m7_move_data_refuses_an_existing_destination(srv_data):
+    # shutil.move would nest the folder inside an existing one of the same name
+    # and the torrent would lose its files: refused before anything moves
+    h = 'F' * 39 + '2'
+    src = os.path.join(srv_data.data_root, 'dup')
+    _write_file(os.path.join(src, 'a.bin'))
+    dst_parent = os.path.join(srv_data.data_root, 'archive-dup')
+    os.makedirs(os.path.join(dst_parent, 'dup'))
+    srv_data.state.add_torrent(h, 'dup', 32, directory=src, is_open=1, is_active=1,
+                               files=[_file_record('a.bin'), _file_record('b.bin')])
+    r = _move(srv_data, h, dst_parent, 302)
+    assert r['error']['code'] == -32603, r
+    assert r['error']['message'].startswith('app: ') and 'already exists' in r['error']['message'], r
+    assert os.path.exists(os.path.join(src, 'a.bin'))
+    t = srv_data.state.torrents[h]
+    assert t['d.directory'] == src and (t['d.is_open'], t['d.is_active']) == (1, 1)
 
 
 def test_move_data_disabled_without_root(srv):

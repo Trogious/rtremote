@@ -1,11 +1,16 @@
 from xml.etree.ElementTree import ParseError, fromstring
 from xml.sax.saxutils import escape
 
-from xmljson import parker
+from xmljson import Parker, parker
 
 from model import File, Global, Peer, Torrent, Tracker
 from scgi import Scgi
 from utils import WHERE_APP, WHERE_RTORRENT, WHERE_RTREMOTE
+
+# the default parker coerces leaf text: a file named "2024" comes back as an
+# int and "1e5" as a float. Anything that ends up as a filesystem path is
+# parsed with this instance instead, which leaves every value a string.
+raw_parker = Parker(xml_fromstring=False)
 
 
 class RpcError(Exception):
@@ -23,13 +28,22 @@ class RpcError(Exception):
 
 
 def classify_fault(code, string, command):
-    # rtorrent fault codes seen in practice; the text is the reliable part
+    # rtorrent fault codes seen in practice; the text is the reliable part.
+    # A stale target is "invalid parameters: info-hash not found" (-500) in
+    # rtorrent 0.16 (rpc/rpc_manager.cc) and was "Could not find info-hash."
+    # (-501) in 0.9; a stale file/tracker index is "invalid parameters: index
+    # not found" and a peer that left "invalid parameters: hash not found"
+    # (the lookup slots in main.cc)
     text = str(string or '')
     label = ' (%s)' % command if command else ''
-    if 'Could not find info-hash' in text:
+    if 'info-hash not found' in text or 'Could not find info-hash' in text:
         return RpcError('rtorrent has no torrent with that hash%s' % label,
                         'the app acted on a torrent rtorrent no longer has; its list refreshes on the next push',
                         WHERE_APP, code, command)
+    if 'index not found' in text or 'hash not found' in text:
+        return RpcError('rtorrent has no such file, tracker or peer on that torrent%s' % label,
+                        'the app acted on a file, tracker or peer entry rtorrent no longer has; '
+                        'the details screen refreshes on its next request', WHERE_APP, code, command)
     if 'not allowed for untrusted connections' in text:
         # the fault names the command rtorrent actually refused, which may be one
         # the requested command runs internally (system.file.allocate under
@@ -95,14 +109,15 @@ class RTorrentRpc:
             value = ''.join(str(value).split())
         return '<param><value><%s>%s</%s></value></param>' % (tag, value, tag)
 
-    def _post(self, body, extra_headers=None, command=None):
+    def _post(self, body, extra_headers=None, command=None, raw=False):
         scgi = Scgi(self.host_port)
         resp = scgi.post(body, extra_headers)
         start = resp.find('<')
         if start < 0:
             raise bad_response_error('no XML in %d bytes' % len(resp), self.host_port)
         try:
-            data = parker.data(fromstring(resp[start:]), preserve_root=True)  # convert to json
+            # raw: leaf text stays a string (paths), see raw_parker
+            data = (raw_parker if raw else parker).data(fromstring(resp[start:]), preserve_root=True)
         except ParseError as e:
             raise bad_response_error('unparseable XML: %s' % e, self.host_port) from e
         RTorrentRpc._check_fault(data, command)
@@ -124,14 +139,14 @@ class RTorrentRpc:
                 pass
             raise classify_fault(code, string, command)
 
-    def call(self, method, params=None, extra_headers=None):
+    def call(self, method, params=None, extra_headers=None, raw=False):
         body = "<?xml version='1.0'?><methodCall><methodName>" + \
             escape(method) + "</methodName><params>"
         if params:
             for p in params:
                 body += RTorrentRpc._param_xml(p)
         body += "</params></methodCall>"
-        return self._post(body, extra_headers, method)
+        return self._post(body, extra_headers, method, raw)
 
     def set_value(self, command, value, untrusted=False):
         # untrusted=True sends rtorrent's UNTRUSTED_CONNECTION=1 SCGI header, so
@@ -142,7 +157,7 @@ class RTorrentRpc:
         headers = [('UNTRUSTED_CONNECTION', 1)] if untrusted else None
         return self.call(command, [('string', ''), ('i8', int(value))], headers)
 
-    def target_command(self, command, target, args=None, untrusted=False):
+    def target_command(self, command, target, args=None, untrusted=False, raw=False):
         # generic command whose first XML-RPC param is the target: '' for a
         # global command, '<hash>' for a download, '<hash>:f<i>'/':t<i>'/':p<id>'
         # for a file/tracker/peer (see rtorrent object_to_target). args is a list
@@ -151,7 +166,7 @@ class RTorrentRpc:
         if args:
             params.extend(args)
         headers = [('UNTRUSTED_CONNECTION', 1)] if untrusted else None
-        return self.call(command, params, headers)
+        return self.call(command, params, headers, raw)
 
     def get_struct(self, command):
         s = '<struct><member><name>methodName</name><value><string>' + escape(command) + \
@@ -173,8 +188,8 @@ class RTorrentRpc:
             methods.append(d['string'])
         return methods
 
-    def multicall(self, method, args):
-        data = self.call(method, RTorrentRpc.string_params(args))
+    def multicall(self, method, args, raw=False):
+        data = self.call(method, RTorrentRpc.string_params(args), raw=raw)
         data = data['methodResponse']['params']['param']['value']['array']['data']
         # an empty result is a childless <data> element: parker turns it into
         # None (compact XML, rtorrent >= 0.10) or a whitespace string (pretty-
@@ -200,8 +215,8 @@ class RTorrentRpc:
         data = self.multicall('p.multicall', [hash, ''] + commands)
         return Peer.get_peers(data, commands)
 
-    def f_multicall(self, hash, commands):
-        data = self.multicall('f.multicall', [hash, ''] + commands)
+    def f_multicall(self, hash, commands, raw=False):
+        data = self.multicall('f.multicall', [hash, ''] + commands, raw)
         return File.get_files(data, commands)
 
     def global_data(self, commands):

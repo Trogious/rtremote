@@ -21,6 +21,14 @@ Speaks just enough of the XML-RPC dialect for server_wss.py:
   scheduling (schedule/schedule.remove) — all recorded so tests can observe them
 - fake.add_torrent / fake.remove_torrent / fake.fail_next_set /
   fake.was_untrusted control methods
+- faults carry rtorrent 0.16's wording and codes: a stale target is -500
+  "invalid parameters: info-hash not found" (0.9 said "Could not find
+  info-hash."), a stale file/tracker index "invalid parameters: index not
+  found", a peer that left "invalid parameters: hash not found"
+- d.directory is rtorrent's root_dir; d.directory.set appends the torrent name
+  for a multi-file torrent (core/download.cc set_directory) while
+  d.directory.base.set takes the path literally; the deprecated redirect
+  d.directory_base(.set) faults here like the other deprecated names
 """
 import os
 import socketserver
@@ -33,7 +41,7 @@ from xml.sax.saxutils import escape
 # names rtorrent master keeps only as deprecated redirects: the fake refuses
 # them so a regression back to the old names is caught by the smoke tests
 DEPRECATED_COMMANDS = {'d.multicall2', 'network.open_sockets', 'network.max_open_sockets',
-                       'network.max_open_sockets.set'}
+                       'network.max_open_sockets.set', 'd.directory_base', 'd.directory_base.set'}
 
 # custom-view filter conditions (the exact strings server_wss.VIEW_FILTER_PRESETS
 # installs via view.filter) mapped to predicates, so an opened custom view returns
@@ -85,6 +93,10 @@ def _fault_struct(code, string):
             '<member><name>faultCode</name><value><i4>%d</i4></value></member>'
             '<member><name>faultString</name><value><string>%s</string></value></member>'
             '</struct></value>' % (code, escape(string)))
+
+
+# rtorrent 0.16's answer to a target hash it does not have (rpc/rpc_manager.cc)
+NO_HASH_FAULT = _fault(-500, 'invalid parameters: info-hash not found')
 
 
 def _response(inner):
@@ -146,7 +158,12 @@ class State:
 
     def add_torrent(self, hash, name, size, complete=0, is_open=1, is_active=1,
                     down_rate=0, up_rate=0, trackers=None, has_active_not_scrape=0,
-                    directory='/home/seed/downloads', files=None):
+                    directory='/home/seed/downloads', files=None, multi_file=None):
+        # multi_file defaults to what the file list implies: more than one file
+        # or a path with a directory in it; `directory` is then the torrent's own
+        # folder (<parent>/<name>), otherwise the shared download directory
+        if multi_file is None:
+            multi_file = bool(files) and (len(files) > 1 or any('/' in str(f.get('f.path', '')) for f in files))
         with self.lock:
             self.torrents[hash] = {
                 'd.hash': hash, 'd.name': name, 'd.size_bytes': size,
@@ -163,7 +180,7 @@ class State:
                 # per-torrent tuning + label (M3 reads) and directory (M7 move data)
                 'd.custom1': '', 'd.priority': 2, 'd.uploads_max': 0,
                 'd.downloads_max': 0, 'd.peers_max': 0, 'd.throttle_name': '',
-                'd.directory': directory,
+                'd.directory': directory, 'd.is_multi_file': 1 if multi_file else 0,
             }
             self.trackers[hash] = trackers or []
             self.peers[hash] = []
@@ -171,6 +188,14 @@ class State:
                 'f.size_chunks': 100, 'f.completed_chunks': 100 if complete else 50,
                 'f.priority': 1, 'f.size_bytes': size, 'f.path': name,
             }]
+
+    @staticmethod
+    def directory_for(t, path):
+        # rtorrent core/download.cc set_directory: a multi-file torrent's root
+        # is <path>/<name>, a single-file torrent's root is the path itself
+        if not t.get('d.is_multi_file'):
+            return path
+        return path + t['d.name'] if (not path or path.endswith('/')) else path + '/' + t['d.name']
 
     def add_next_torrent(self, payload, raw, start, trailing):
         # simulate load.start/load.raw_start: synthesize a torrent from the magnet's
@@ -371,7 +396,7 @@ class Responder:
                       'f.multicall': state.files}[method]
             with state.lock:
                 if hash not in source:
-                    return _fault(-501, 'Could not find info-hash.')
+                    return NO_HASH_FAULT
                 rows = [self.row(item, commands) for item in source[hash]]
             return _response(self.array(rows))
 
@@ -400,10 +425,12 @@ class Responder:
             hash = params[0] if params else ''
             with state.lock:
                 if hash not in state.torrents:
-                    return _fault(-501, 'Could not find info-hash.')
+                    return NO_HASH_FAULT
                 t = state.torrents[hash]
-                if method in ('d.start', 'd.open', 'd.resume'):
+                if method in ('d.start', 'd.resume'):
                     t['d.is_open'], t['d.is_active'] = 1, 1
+                elif method == 'd.open':
+                    t['d.is_open'] = 1  # open is not started, like the real thing
                 elif method in ('d.stop', 'd.close'):
                     t['d.is_open'], t['d.is_active'] = 0, 0
                 elif method == 'd.pause':
@@ -422,8 +449,12 @@ class Responder:
             hash, idx = _split_index(params[0], 'f')
             with state.lock:
                 files = state.files.get(hash)
-                if files is None or idx is None or idx >= len(files):
-                    return _fault(-501, 'invalid file target.')
+                if files is None:
+                    return NO_HASH_FAULT
+                if idx is None:
+                    return _fault(-500, 'invalid parameters: no index')
+                if idx >= len(files):
+                    return _fault(-500, 'invalid parameters: index not found')
                 files[idx]['f.priority'] = params[1]
             return _response(self.value(params[1]))
 
@@ -432,8 +463,12 @@ class Responder:
             hash, idx = _split_index(params[0], 't')
             with state.lock:
                 trackers = state.trackers.get(hash)
-                if trackers is None or idx is None or idx >= len(trackers):
-                    return _fault(-501, 'invalid tracker target.')
+                if trackers is None:
+                    return NO_HASH_FAULT
+                if idx is None:
+                    return _fault(-500, 'invalid parameters: no index')
+                if idx >= len(trackers):
+                    return _fault(-500, 'invalid parameters: index not found')
                 trackers[idx]['t.is_enabled'] = params[1]
             return _response(self.value(params[1]))
 
@@ -442,11 +477,13 @@ class Responder:
             hash, peer_id = _split_peer(params[0])
             with state.lock:
                 peers = state.peers.get(hash)
-                if peers is None or peer_id is None:
-                    return _fault(-501, 'invalid peer target.')
+                if peers is None:
+                    return NO_HASH_FAULT
+                if peer_id is None or len(peer_id) != 40:
+                    return _fault(-500, 'invalid parameters: target is not 40 bytes long')
                 peer = next((p for p in peers if p.get('p.id') == peer_id), None)
                 if peer is None:
-                    return _fault(-501, 'peer not found.')
+                    return _fault(-500, 'invalid parameters: hash not found')
                 if method == 'p.disconnect':
                     peers.remove(peer)
                 elif method == 'p.banned.set':
@@ -470,7 +507,7 @@ class Responder:
             url = params[-1]
             with state.lock:
                 if hash not in state.trackers:
-                    return _fault(-501, 'Could not find info-hash.')
+                    return NO_HASH_FAULT
                 state.trackers[hash].append(_new_tracker(int(params[1]), url))
                 state.torrents[hash]['d.tracker_size'] = len(state.trackers[hash])
             return _response(self.value(0))
@@ -522,8 +559,13 @@ class Responder:
                 hash, value = params[0], params[1]
                 with state.lock:
                     if hash not in state.torrents:
-                        return _fault(-501, 'Could not find info-hash.')
-                    state.torrents[hash][base] = value
+                        return NO_HASH_FAULT
+                    t = state.torrents[hash]
+                    if base == 'd.directory':
+                        value = state.directory_for(t, value)  # appends the name for multi-file
+                    elif base == 'd.directory.base':
+                        base = 'd.directory'  # the literal root_dir setter
+                    t[base] = value
                 return _response(self.value(value))
             with state.lock:
                 if state.fail_next_set:
@@ -536,7 +578,7 @@ class Responder:
             with state.lock:
                 if params and params[0] in state.torrents:
                     return _response(self.value(state.torrents[params[0]][method]))
-            return _fault(-501, 'Could not find info-hash.')
+            return NO_HASH_FAULT
 
         with state.lock:
             if method in state.globals:

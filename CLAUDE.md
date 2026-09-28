@@ -128,16 +128,39 @@ The Android app speaks JSON-RPC 2.0 over a single persistent secure WebSocket.
     `set_throttle_name {hash, name}` (name must be a group rtremote created),
     `set_label {hash, label}`, `peer_action {hash, peer, peer_action}` (level 5).
   - `erase_torrent {hash, with_data}`, `add_tracker {hash, tracker_url}` (level 6).
+    With `with_data`, rtremote deletes the files itself after `d.erase`
+    (rtorrent never touches data), then, for a **multi-file** torrent only,
+    the now-empty directories of the torrent's own layout deepest first and
+    finally its folder, using nothing but `os.remove` / `os.rmdir`: a
+    foreign file keeps its folder (logged at INFO as "kept ..."), and the
+    shared download directory a **single-file** torrent lives in is never
+    touched (`d.directory` is that directory for single-file torrents). What
+    could not be deleted comes back as `-32603` naming the path, with the
+    torrent already gone from rtorrent (`Remote.EraseOutcome`).
   - `throttle_group {name, up_kb, down_kb}`, `set_schedule {up/down_day,
     up/down_night, day_hhmm, night_hhmm}`, `clear_schedule {}` (level 7).
   - `add_view {name, filter}` (filter is a safe preset rtremote maps to an
     rtorrent expression), `move_data {hash, directory}` (level 8).
+    `move_data` closes the torrent, moves a multi-file torrent's folder as a
+    whole (or only the file of a single-file torrent) under the new
+    directory, sets the root with `d.directory.base.set` (literal;
+    `d.directory.set` would append the torrent name again for a multi-file
+    torrent, `core/download.cc set_directory`) and brings it back with
+    `d.resume` if it was active, `d.open` if it was merely open. Not
+    `d.start`: a torrent closed with `d.close` never left the `started` view,
+    so re-adding it there is a no-op, while `d.resume` re-opens it, re-checks
+    it from the resume data and activates it (verified on 0.16.22). An
+    existing destination is refused before anything moves; a failed move is
+    rolled back. Safe on a closed torrent: libtorrent's `is_hash_checked()`
+    is false while closed, so rtorrent's "files have been moved" refusal
+    does not apply.
   - Write calls carry rtorrent's `UNTRUSTED_CONNECTION=1` header only for
     the global throttle / peer-limit setters flagged in `Remote.GLOBAL_SETTERS`
     and the file/tracker/peer setters (`f.priority.set`, `t.is_enabled.set`,
     `p.banned.set`, `p.snubbed.set`, `p.disconnect`). Everything else goes out
     trusted, including **every per-torrent action** (`Remote.TORRENT_ACTIONS`),
-    `d.erase` and the `d.close`/`d.open` pair inside `move_data`. rtorrent does
+    `d.erase` and the `d.close` / `d.directory.base.set` / `d.resume` (or
+    `d.open`) sequence inside `move_data`. rtorrent does
     mark `d.pause`/`d.resume`/`d.open`/`d.close`/`d.check_hash`/`d.erase` safe,
     but they are unusable under the header: the trust flag is per request and
     `CommandMap::call_command` checks it for every nested command too, and
@@ -233,6 +256,12 @@ change, so an idle client receives nothing.
   `is_busy_not_scrape`) is embedded under `trackers` for the app's announce
   indicator. Add new aliases in `GLOBAL_ALIASES` / `TORRENT_ALIASES` if
   rtorrent renames more commands.
+  `d.directory` is rtorrent's `root_dir`: the torrent's own folder
+  (`<parent>/<name>`) for a multi-file torrent but the **shared download
+  directory** for a single-file one, which is why erase-with-data and
+  move-data branch on `d.is_multi_file`. Paths are fetched with
+  `rpc.raw_parker` (`raw=True`) so a file named `2024` is not coerced to an
+  int on the way to `os.remove`.
 - **`model.py`** — POPO containers (`Global`, `Torrent`, `Tracker`, `Peer`,
   `File`, `Client`). `add_attribute` reflects XML-RPC keys (`d.bytes_done=` →
   `bytes_done`) onto the object via `__setattr__`. Diff/serialization uses
@@ -293,7 +322,10 @@ rtorrent master keeps `d.multicall2`, `network.open_sockets` and
 rtorrent faults on the old names so a regression is caught by the smoke
 tests. `network.max_open_files.set` and
 `network.http.max_total_connections.set` are no-op stubs in master: never
-expose them as setters.
+expose them as setters. `d.directory_base` / `d.directory_base.set` are
+redirects too (renamed to `d.directory` / `d.directory.base.set` in
+v0.16.22, the first release with `system.api_version`); rtremote uses
+`d.directory.base.set` and the fake faults on the old names.
 
 ### Diagnostic logging (who is to blame: rtorrent, app, or rtremote)
 
@@ -314,9 +346,15 @@ naming the component a user should look at, followed by an optional
   (an unexpected exception type = an rtremote bug).
 - Transport and RPC errors carry their own diagnosis: `scgi.ScgiError`
   (`classify_socket_error`: socket missing / refused / permission / timeout /
-  reset) and `rpc.RpcError` (`classify_fault`: unknown hash → `app`,
-  untrusted-rejected → `rtremote` bug, unknown command → rtorrent too old,
-  non-XML answer → wrong socket). Both have `.where` and `.hint`.
+  reset) and `rpc.RpcError` (`classify_fault`: unknown hash → `app` in both
+  rtorrent wordings, `invalid parameters: info-hash not found` (0.16,
+  `rpc/rpc_manager.cc`, fault -500) and `Could not find info-hash.` (0.9);
+  stale file/tracker index or departed peer (`index not found` /
+  `hash not found`, the slots in `main.cc`) → `app`; untrusted-rejected →
+  `rtremote` bug, unknown command → rtorrent too old, non-XML answer → wrong
+  socket). Both have `.where` and `.hint`. Match rtorrent's actual wording:
+  the classifier was once written against the 0.9 text only and every stale
+  hash on 0.16 was blamed on rtorrent.
 - rtorrent outages are collapsed by `Outage` in the updater: one line when
   polling starts failing (message + hint), one on recovery with the duration;
   identical repeats go to DEBUG. Do not log per failed tick.
@@ -413,6 +451,11 @@ CLI flags: `-f` / `--foreground` — do not daemonize.
   and move-data; both are confined to `RTR_DATA_ROOT` by a realpath check
   (`Remote._require_under`) and are disabled (return `-32603`) when it is
   unset. rtremote never deletes or moves a path outside that root.
+  Erase-with-data deletes files and only the torrent's own now-empty
+  directories (`os.rmdir`, never `rmtree`, never the data root itself);
+  single-file torrents live in the shared download directory, which is left
+  alone. Move-data moves the folder (multi-file) or just the file
+  (single-file) and refuses an existing destination.
 - Write calls carry rtorrent's `UNTRUSTED_CONNECTION=1` SCGI header where
   rtorrent's own untrusted-safe allowlist (`rpc.mark_safe`) covers the
   command **and** the command's implementation runs no unsafe command
@@ -444,8 +487,13 @@ The `test/` package is pytest-driven:
   untrusted-safe allowlist for `UNTRUSTED_CONNECTION=1` requests (minus the
   six `d.*` actions that break under the header on the real thing, which
   the fake faults on so a re-added header fails the smoke tests), all four
-  multicalls, `fake.add_torrent` / `fake.remove_torrent` /
-  `fake.fail_next_set` / `fake.was_untrusted` control methods).
+  multicalls, faults in rtorrent 0.16's wording and codes (`-500 invalid
+  parameters: info-hash not found` etc.), `d.is_multi_file` per torrent and
+  rtorrent's directory-setter semantics (`d.directory.set` appends the name
+  for multi-file torrents, `d.directory.base.set` is literal, the deprecated
+  `d.directory_base(.set)` faults), `fake.add_torrent` /
+  `fake.remove_torrent` / `fake.fail_next_set` / `fake.was_untrusted` control
+  methods).
 - **`wss_smoke_test.py`** — full end-to-end protocol suite against the fake,
   **no rtorrent or Linux required**; runs the real daemonized server in a
   temp dir and covers registration per view, details, diff pushes, per-view
@@ -455,8 +503,10 @@ The `test/` package is pytest-driven:
   paths, view re-registration, and updater resilience across an rtorrent
   outage.
 - **`plugins_test.py`** — direct unit tests for plugins.
+- **`rpc_test.py`** — unit tests for `classify_fault` (both rtorrent wordings
+  of a stale hash, stale index/peer, untrusted, unknown command, fallback).
 
-Local quick run (any OS): `PYTHONPATH=. pytest test/plugins_test.py test/wss_smoke_test.py`
+Local quick run (any OS): `PYTHONPATH=. pytest test/rpc_test.py test/plugins_test.py test/wss_smoke_test.py`
 
 GitHub Actions runs two workflows on ubuntu-latest / Python 3.12, both of
 which download a **prebuilt static rtorrent 0.16.22** from

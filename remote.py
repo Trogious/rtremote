@@ -1,5 +1,7 @@
 import base64
 import binascii
+import collections
+import errno
 import os
 import re
 import shutil
@@ -227,58 +229,177 @@ class Remote:
         # d.tracker.insert(hash, group, url); group 0 is the primary group
         self.rpc.target_command('d.tracker.insert', hash, [('string', '0'), ('string', url)])
 
-    def get_file_paths(self, hash):
-        # absolute on-disk paths of a torrent's files (d.directory + each f.path)
-        directory = self._get_string('d.directory', hash)
-        files = self.rpc.f_multicall(hash, ['f.path='])
-        return directory, [os.path.join(directory, f.path) for f in files]
+    # outcome of erase_torrent(with_data=True): `kept` are the directories left
+    # because they hold files that are not part of the torrent, `failed` lists
+    # (path, OSError) pairs for what could not be deleted after rtorrent had
+    # already erased the torrent, `total` is the torrent's file count
+    EraseOutcome = collections.namedtuple('EraseOutcome', 'kept failed total')
 
-    def _get_string(self, command, hash):
-        data = self.rpc.target_command(command, hash)
+    def get_file_paths(self, hash):
+        # absolute on-disk paths of a torrent's files: d.directory + each f.path.
+        # d.directory is rtorrent's root_dir: the torrent's own folder
+        # (<parent>/<name>) for a multi-file torrent, but the shared download
+        # directory for a single-file one. Parsed raw so that a file named
+        # "2024" stays a string (rpc.raw_parker).
+        directory = self._get_string('d.directory', hash, raw=True) or ''
+        if not directory:
+            return '', []
+        files = self.rpc.f_multicall(hash, ['f.path='], raw=True)
+        return directory, [os.path.join(directory, f.path) for f in files if getattr(f, 'path', None)]
+
+    def is_multi_file(self, hash):
+        return self._get_int('d.is_multi_file', hash) == 1
+
+    def _get_string(self, command, hash, raw=False):
+        data = self.rpc.target_command(command, hash, raw=raw)
         value = data['methodResponse']['params']['param']['value']
         return next(iter(value.values())) if isinstance(value, dict) else value
 
+    def _get_int(self, command, hash):
+        return int(self._get_string(command, hash) or 0)
+
     def erase_torrent(self, hash, with_data=False, data_root=None):
-        paths = []
-        directory = None
+        # with_data: the torrent's files go first; a multi-file torrent then
+        # loses the now-empty directories of its own layout, deepest first, and
+        # finally its folder. Only os.remove / os.rmdir are used, so a file the
+        # user put there keeps its folder alive, and nothing above the torrent's
+        # folder is touched: for a single-file torrent that folder is the shared
+        # download directory, which is left alone entirely. Returns an
+        # EraseOutcome; the caller reports what stayed behind.
+        directory, paths, multi_file = '', [], False
         if with_data:
+            Remote._require_root(data_root)
             directory, paths = self.get_file_paths(hash)
-            for p in paths:
-                Remote._require_under(p, data_root)
+            multi_file = self.is_multi_file(hash)
+            for path in paths:
+                Remote._require_under(path, data_root)
+            if multi_file and directory:
+                Remote._require_under(directory, data_root)
         # trusted: d.erase is marked safe but runs close() and the
         # event.download.erased hooks (ui.unfocus_download, d.delete_tied, user
         # hooks), which fail under the untrusted header - see TORRENT_ACTIONS
         self.rpc.target_command('d.erase', hash)
-        if with_data:
-            for p in paths:
-                try:
-                    if os.path.isfile(p) or os.path.islink(p):
-                        os.remove(p)
-                except OSError:
-                    pass
-            # remove the torrent's own directory if it is now empty and under root
+        if not with_data:
+            return Remote.EraseOutcome([], [], 0)
+        failed = Remote._delete_files(paths)
+        kept = []
+        # never prune the data root itself, even if a torrent's folder is it
+        if multi_file and directory and os.path.realpath(directory) != os.path.realpath(data_root):
+            kept, dir_failed = Remote._prune_dirs(directory, paths)
+            failed += dir_failed
+        return Remote.EraseOutcome(kept, failed, len(paths))
+
+    @staticmethod
+    def _delete_files(paths):
+        failed = []
+        for path in paths:
             try:
-                if directory and Remote._is_under(directory, data_root) and not os.listdir(directory):
-                    os.rmdir(directory)
-            except OSError:
+                if os.path.islink(path) or os.path.isfile(path):
+                    os.remove(path)
+            except OSError as e:
+                failed.append((path, e))
+        return failed
+
+    @staticmethod
+    def _prune_dirs(directory, paths):
+        # the directories of the torrent's own layout below its folder, deepest
+        # first, then the folder itself; rmdir refuses anything non-empty, so a
+        # foreign file keeps its directory and, by implication, the parents
+        directory = os.path.normpath(directory)
+        below = set()
+        for path in paths:
+            d = os.path.dirname(os.path.normpath(path))
+            while d.startswith(directory + os.sep):
+                below.add(d)
+                d = os.path.dirname(d)
+        kept, failed = [], []
+        for d in sorted(below, key=lambda d: d.count(os.sep), reverse=True) + [directory]:
+            try:
+                os.rmdir(d)
+            except FileNotFoundError:
                 pass
+            except OSError as e:
+                if e.errno in (errno.ENOTEMPTY, errno.EEXIST, errno.ENOTDIR):
+                    kept.append(d)  # holds something not from the torrent (or is a symlink)
+                else:
+                    failed.append((d, e))
+        # report the innermost kept directories only; their parents follow from them
+        kept = [k for k in kept if not any(o != k and o.startswith(k + os.sep) for o in kept)]
+        return kept, failed
+
+    @staticmethod
+    def left_behind_error(outcome):
+        # the first failure re-raised as its own OSError type, so that
+        # server_wss.describe_failure keeps its permission / missing-path /
+        # filesystem classification, with the tally in the text
+        path, e = outcome.failed[0]
+        detail = '%s; rtorrent erased the torrent but %d of its %d files (or their directories) ' \
+                 'could not be deleted' % (e.strerror or e, len(outcome.failed), outcome.total)
+        return type(e)(e.errno, detail, path) if e.errno else e
 
     def move_data(self, hash, directory, data_root):
         directory = os.path.normpath(directory)
         Remote._require_under(directory, data_root)
-        src_dir, _ = self.get_file_paths(hash)
+        src_dir, paths = self.get_file_paths(hash)
         src_dir = os.path.normpath(src_dir)
         Remote._require_under(src_dir, data_root)
-        base = os.path.basename(src_dir.rstrip('/'))
-        dst = os.path.join(directory, base)
-        Remote._require_under(dst, data_root)
+        if self.is_multi_file(hash):
+            # the torrent owns src_dir (<parent>/<name>, possibly renamed): the
+            # folder moves as a whole and becomes the new root directory
+            moves = [(src_dir, os.path.join(directory, os.path.basename(src_dir)))]
+            new_root = moves[0][1]
+        else:
+            # src_dir is the shared download directory: only the torrent's own
+            # file moves, and the destination directory itself is the new root
+            moves = [(path, os.path.join(directory, os.path.basename(path))) for path in paths]
+            new_root = directory
+        for src, dst in moves:
+            Remote._require_under(src, data_root)
+            Remote._require_under(dst, data_root)
+            if os.path.lexists(dst):
+                raise RpcError('%s already exists' % dst,
+                               'the app asked to move data onto an existing path; pick another directory',
+                               WHERE_APP)
+        was_open = self._get_int('d.is_open', hash) == 1
+        was_active = self._get_int('d.is_active', hash) == 1
         self.rpc.target_command('d.close', hash)  # trusted, see TORRENT_ACTIONS
-        os.makedirs(directory, exist_ok=True)
-        if os.path.exists(src_dir):
-            shutil.move(src_dir, dst)
-        self.rpc.target_command('d.directory.set', hash, [('string', dst)])
-        self.rpc.target_command('d.open', hash)  # trusted, see TORRENT_ACTIONS
-        return dst
+        done = []
+        try:
+            os.makedirs(directory, exist_ok=True)
+            for src, dst in moves:
+                if os.path.lexists(src):
+                    shutil.move(src, dst)
+                    done.append((src, dst))
+            # d.directory.base.set takes the root directory literally; d.directory.set
+            # would append the torrent name again for a multi-file torrent
+            # (rtorrent core/download.cc set_directory). Safe on a closed torrent:
+            # the "files have been moved" check only applies while hash-checked.
+            self.rpc.target_command('d.directory.base.set', hash, [('string', new_root)])
+        except Exception:
+            for src, dst in reversed(done):  # best effort: put the data back
+                try:
+                    shutil.move(dst, src)
+                except OSError:
+                    pass
+            self._reopen(hash, was_open, was_active, best_effort=True)
+            raise
+        self._reopen(hash, was_open, was_active)
+        return new_root
+
+    def _reopen(self, hash, was_open, was_active, best_effort=False):
+        # undo what d.close did. A torrent closed with d.close never left the
+        # `started` view, so d.start (= re-add to that view) is a no-op on it;
+        # d.resume re-opens it, re-checks from the resume data and activates it
+        # (verified on 0.16.22). d.open only opens; a torrent that was closed
+        # stays closed. All trusted, see TORRENT_ACTIONS.
+        command = 'd.resume' if was_active else 'd.open' if was_open else None
+        if command is None:
+            return
+        try:
+            self.rpc.target_command(command, hash)
+        except RpcError:
+            if not best_effort:
+                raise
 
     def throttle_group_set(self, name, up_kb, down_kb):
         # throttle.up/throttle.down create-or-resize a named group; rate is KiB/s,
@@ -332,11 +453,15 @@ class Remote:
         return target == root or target.startswith(root + os.sep)
 
     @staticmethod
-    def _require_under(path, root):
+    def _require_root(root):
         if not root:
             raise RpcError('data operations are not enabled on this server',
                            'set RTR_DATA_ROOT in start.sh to the directory rtremote may move or delete files under',
                            WHERE_RTREMOTE)
+
+    @staticmethod
+    def _require_under(path, root):
+        Remote._require_root(root)
         if not Remote._is_under(path, root):
             raise RpcError('path is outside the configured data root',
                            'the app asked to touch %s, which is not under RTR_DATA_ROOT=%s' % (path, root),

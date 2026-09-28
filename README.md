@@ -48,8 +48,8 @@ The third column is the component to look at:
 | Column value | Meaning | Typical lines |
 | ------------ | ------- | ------------- |
 | `rtorrent`   | rtorrent is down, unreachable, hung, too old, or rejected a command | SCGI socket not found / connection refused / no answer within `RTR_SCGI_TIMEOUT`; "does not know the command" (rtorrent < 0.16); "rtorrent is back after Ns" |
-| `app`        | what arrived from the phone is the problem | secret key mismatch; the app rejected the TLS certificate (keystore / "accept self-signed"); the app asked for a method this rtremote does not have (update rtremote); a torrent the app acted on no longer exists; the phone stopped reading |
-| `rtremote`   | this server: configuration, deployment, or a bug | certificate file missing or unreadable; listen port already in use; `RTR_DATA_ROOT` unset or not writable; anything with a traceback (please report it) |
+| `app`        | what arrived from the phone is the problem | secret key mismatch; the app rejected the TLS certificate (keystore / "accept self-signed"); the app asked for a method this rtremote does not have (update rtremote); a torrent (or a file, tracker or peer entry) the app acted on no longer exists; the phone stopped reading |
+| `rtremote`   | this server: configuration, deployment, or a bug | certificate file missing or unreadable; listen port already in use; `RTR_DATA_ROOT` unset or not writable; files erase-with-data could not delete (permissions); anything with a traceback (please report it) |
 
 Everything after `->` is what to check. Errors the app displays are prefixed the same way (`rtorrent: ...`, `rtremote: ...`, `app: ...`).
 
